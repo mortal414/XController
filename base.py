@@ -487,6 +487,8 @@ class SocialPlatformAdapter(ABC):
         platform_post_id: str,
         output_dir: str,
         frame_count: int = 3,
+        *,
+        overwrite: bool = False,
     ) -> list[MediaCaptureData]:
         raise NotImplementedError
 
@@ -555,6 +557,10 @@ class SocialPlatformAdapter(ABC):
     async def delete_repost(self, platform_post_id: str) -> bool:
         raise NotImplementedError
 
+    async def delete_quote(self, platform_post_id: str) -> bool:
+        """Delete an owned quote post when the implementation supports it."""
+        raise NotImplementedError
+
     @abstractmethod
     async def delete_all_posts(self) -> list[str]:
         raise NotImplementedError
@@ -565,6 +571,10 @@ class SocialPlatformAdapter(ABC):
 
     @abstractmethod
     async def delete_all_reposts(self) -> list[str]:
+        raise NotImplementedError
+
+    async def delete_all_quotes(self) -> list[str]:
+        """Delete owned quote posts when the implementation supports it."""
         raise NotImplementedError
 
     @abstractmethod

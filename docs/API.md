@@ -36,9 +36,11 @@ Additional exported diagnostics types:
 
 ## Synchronous Facade
 
-`SyncXController(profile_path=..., settings=..., proxy=...)` owns an internal event loop thread and exposes synchronous methods for service runtimes that cannot call async controller methods directly. `XControllerService` is an alias.
+`SyncXController(profile_path=..., settings=..., proxy=..., call_timeout_seconds=120, close_timeout_seconds=10)` owns an internal event loop thread and exposes synchronous methods for service runtimes that cannot call async controller methods directly. Calls are serialized because one controller owns one stateful browser page. Expired calls are cancelled and raise `TimeoutError`; because cancellation cannot prove that a browser-side action stopped, the facade is then poisoned and must be closed/recreated. An already-running synchronous Playwright executor call may outlive in-process cancellation and retain the profile lock; deployments that require hard timeout isolation should run the controller in a restartable worker process. Shutdown uses its own finite timeout. `XControllerService` is an alias.
 
 The facade forwards stable service APIs including lifecycle, login state, current state/surface, health checks, detailed timeline reads, notifications, thread context, search, action preflight, detailed actions, metrics, account stats, debug snapshots, and media capture.
+
+One async adapter also serializes its public workflows around the single stateful page. `adapter.sync()` must be called before `adapter.start()`; an already-started adapter is rejected rather than transferred across event loops.
 
 `ControllerSettings(playwright_mode="sync", prefer_sync_playwright=True)` controls Playwright transport inside the browser controller. `SyncXController` controls the caller contract and removes the need for downstream code to own `asyncio.new_event_loop()`, worker threads, or `asyncio.run_coroutine_threadsafe()`.
 
@@ -62,7 +64,7 @@ The facade forwards stable service APIs including lifecycle, login state, curren
 - `await account_stats(handle: str | None = None) -> AccountStats`
 - `await profile_recent_metrics(username: str, limit: int = 40, source: str | None = None) -> list[dict[str, int | str | bool]]`
 - `await post_metrics(platform_post_id: str) -> dict[str, int]`
-- `await capture_post_media(platform_post_id, output_dir, frame_count: int = 3) -> list[MediaCaptureData]`
+- `await capture_post_media(platform_post_id, output_dir, frame_count: int = 3, *, overwrite: bool = False) -> list[MediaCaptureData]`
 
 `read_notifications(unread_only=True)` returns unread notifications without a separate alias method.
 
@@ -70,7 +72,7 @@ The facade forwards stable service APIs including lifecycle, login state, curren
 
 `read_timeline_detailed(force_refresh=True)` performs a home reload before collecting timeline posts. `reset_scroll=True` only presses Home to read the newest visible DOM items at the top of the feed; it does not reload the UI.
 
-`capture_post_media()` opens the target post, resolves the main article, screenshots image cards and representative video frames into `output_dir`, and returns normalized artifact rows.
+`capture_post_media()` opens the target post, resolves the exact main article, screenshots image cards and representative video frames into `output_dir`, and returns normalized artifact rows. `frame_count` must be a positive integer. Existing generated names are refused unless `overwrite=True`, and symlink targets are always refused.
 
 `account_stats()` samples public profile-level data: handle, display name, profile URL, followers, following, posts, likes, media, verified state, bio, location, and joined date text. When `handle` is omitted, it uses the authenticated account when detectable and falls back to the current profile surface if needed. Counts are normalized from compact X strings such as `1.2K`, `3.4M`, and `5B`. Unavailable fields remain zero or `None`, and `raw["warnings"]` plus `raw["current_url"]` explain what was missing. Browser transport failures such as `profile_in_use`, `playwright_driver_connection_closed`, and `target_page_or_context_closed` are raised as `RuntimeError`.
 
@@ -84,9 +86,11 @@ The facade forwards stable service APIs including lifecycle, login state, curren
 - `await delete_post(platform_post_id: str) -> bool`
 - `await delete_reply(platform_post_id: str) -> bool`
 - `await delete_repost(platform_post_id: str) -> bool`
+- `await delete_quote(platform_post_id: str) -> bool`
 - `await delete_all_posts() -> list[str]`
 - `await delete_all_replies() -> list[str]`
 - `await delete_all_reposts() -> list[str]`
+- `await delete_all_quotes() -> list[str]`
 - `await delete_all_content() -> dict[str, list[str]]`
 - `await follow_user(username: str) -> bool`
 - `await unfollow_user(username: str) -> bool`
@@ -113,16 +117,21 @@ Preflight and diagnostics:
 - `await current_surface() -> dict[str, str]`
 - `await settle_home(tab: str = "for_you", force_nav: bool = False) -> bool`
 - `await health_check() -> ControllerHealth`
-- `await debug_snapshot(output_dir, article_limit: int = 12) -> dict`
+- `await debug_snapshot(output_dir, article_limit: int = 12, *, overwrite: bool = False, include_sensitive_content: bool = False) -> dict`
+
+`debug_snapshot()` writes a redacted manifest by default. HTML, a screenshot, article summaries, visible dialogs, and detailed login data are omitted unless `include_sensitive_content=True`; when enabled, all emitted artifacts are sensitive browser-session data. Existing requested targets are never overwritten unless `overwrite=True`, symlink targets are refused, and safe mode refuses a directory that already contains `page.html` or `page.png` rather than silently leaving sensitive artifacts beside a new manifest.
+
+Image attachment preflight validates PNG, JPEG, GIF, and WebP file signatures in addition to paths and extensions.
 
 ## Compatibility Guidance
 
+- `SocialPlatformAdapter.quote_post()`, `delete_quote()`, and `delete_all_quotes()` remain optional, non-abstract extension hooks in the 0.1.x contract. Existing third-party adapter subclasses are not made abstract by the quote-cleanup additions.
 - `reply_to_post()` is the canonical X-specific method name.
 - `comment_post()` has been removed. Use `reply_to_post()`.
 - `read_unread_notifications()` has been removed. Use `read_notifications(unread_only=True)`.
 - `recover_home()` and `refresh_home()` have been replaced by `return_home(force_refresh=False)`.
 - `post_text()`, `reply_to_post()`, and `quote_post()` accept `image_paths` for local image uploads. `post_image()`, `reply_with_image()`, and `quote_post_with_image()` remain only as deprecated compatibility wrappers.
-- Delete methods verify ownership before deleting authored content.
+- Delete methods verify exact target identity, independently observed content kind, and ownership before deleting authored content.
   `delete_repost()` verifies repost state instead of authorship because reposts target another author's post.
 - Bulk delete methods run until the relevant profile surface is exhausted; they no longer expose a caller-supplied item limit.
 
@@ -257,6 +266,8 @@ Convenience helpers:
 
 Use `ControllerSettings.to_dict()` when you need to persist or inspect the active values.
 
+Mappings with unknown keys are rejected instead of silently ignored. Plain objects contribute only matching attributes. Invalid boolean or integer field types, transport modes, account handles, cooldowns, negative or reversed timing ranges, non-positive or reversed viewport ranges, and empty user-agent strings raise during settings construction instead of failing after browser startup. `default_user_agent=None` (the default) preserves the bundled browser's native user agent; set a non-empty string only when an embedding application explicitly needs an override.
+
 Notable maintainability setting:
 
 - `strict_ui_failures`
@@ -265,3 +276,7 @@ Notable maintainability setting:
   Accepts `"auto"`, `"async"`, or `"sync"` to control whether startup prefers async Playwright or the sync fallback.
 - `prefer_sync_playwright`
   Optional boolean override for callers that need explicit runtime/thread ownership.
+- `expected_account_handle`
+  Optional X handle that must match the authenticated persistent profile before any mutation is allowed.
+- `rate_limit_cooldown_seconds`
+  Positive local cooldown applied after a scoped visible X system message reports rate limiting. Defaults to 300 seconds.

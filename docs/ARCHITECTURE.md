@@ -14,12 +14,18 @@ The DOM selector surface and soft-failure diagnostics are now split into dedicat
 
 The library favors click-driven navigation first and uses direct URL navigation as a recovery path.
 
-`main` intentionally contains only the reusable controller package. Lab UI, lab API, and test harness files belong on `labui-testing`.
+`main` is the repository's single long-lived branch and contains the reusable package, its regression tests, packaging metadata, and maintained documentation. Experimental applications belong in separate repositories or focused short-lived branches.
 
 ## Current Main-Branch Modules
 
 - `adapter.py`
-  Main controller implementation and X-specific flow logic.
+  Thin public composition layer that combines the runtime, read, and write mixins.
+- `_adapter_runtime.py`
+  Browser lifecycle, trusted-origin navigation, low-level DOM helpers, article identity, and shared state detection.
+- `_adapter_read.py`
+  Timeline, search, notification, profile, health, preflight, diagnostic, and media-capture reads.
+- `_adapter_write.py`
+  Compose, engagement, follow/unfollow, and verified deletion flows.
 - `sync.py`
   Synchronous facade that owns an event-loop thread and forwards stable service APIs.
 - `_ui_selectors.py`
@@ -35,7 +41,7 @@ The library favors click-driven navigation first and uses direct URL navigation 
 
 ## Adapter Organization
 
-Inside `XController`, methods now fall into clearer buckets:
+Inside `XController`, methods fall into clearer buckets:
 
 - startup/shutdown
 - sync fallback helpers
@@ -48,8 +54,12 @@ The current maintenance boundary is:
 
 - `_ui_selectors.py`
   Selector drift and X wording changes.
-- `adapter.py`
-  Flow orchestration, retries, state transitions, detailed service APIs, browser snapshots, passive login state, and post media capture.
+- `_adapter_runtime.py`
+  Browser ownership, trusted X origin checks, state transitions, low-level actionability, and post/article identity.
+- `_adapter_read.py`
+  Non-mutating collection, parsing, health, diagnostics, and post media capture.
+- `_adapter_write.py`
+  Mutating orchestration and detailed action outcomes. A delivered write trigger is never replayed merely because confirmation is ambiguous.
 - `sync.py`
   Synchronous caller contract only. It should not duplicate DOM selectors or browser flow logic.
 - `_diagnostics.py`
@@ -78,6 +88,16 @@ Long-running service callers should prefer:
 
 The main cleanup rule applied here was: keep the public behavior stable, but consolidate duplicate internal logic where possible.
 
+## Safety Boundaries
+
+- Only HTTPS `x.com` and `www.x.com` pages are trusted as action surfaces. Existing unrelated browser tabs are not adopted for X interactions.
+- Targeted actions resolve an exact normalized status ID; substring URL matches and first-article fallbacks are rejected.
+- Destructive actions require an independently observed content kind, ownership/state checks, and an article-scoped native control.
+- All mutations pass a shared health gate for trusted origin, login state, account locks, blocking modals, rate-limit cooldown, and optional expected-account identity.
+- Persistent Chromium profiles are authentication material. They are ignored by Git and must be protected outside the package.
+- Diagnostic snapshots and captured media may contain private visible content and must be stored and retained as sensitive artifacts.
+- The synchronous facade serializes access to the one stateful page and applies finite call timeouts.
+
 ## Compatibility Choices
 
 - `XController` remains an alias of `XTextAdapter`.
@@ -86,14 +106,14 @@ The main cleanup rule applied here was: keep the public behavior stable, but con
 - Image-capable post, reply, and quote methods accept `image_paths`; image-only wrappers are deprecated compatibility helpers.
 - Detailed action methods report their observed final surface, but callers that require a known feed surface should call `settle_after_action()`.
 
-## Branch Separation
+## Branch Policy
 
 - `main`
-  Releasable controller code and docs only.
-- `labui-testing`
-  Streamlit/FastAPI tooling, manual walkthrough utilities, and automated tests.
+  Releasable controller code, tests, packaging, and documentation.
+- Short-lived branches
+  Focused implementation, test, or documentation work merged through pull requests.
 
-Core fixes may be developed on `labui-testing`, but they should be merged back into `main` selectively so `main` stays consumable by the downstream project.
+The current remote has no `labui-testing` branch. CI validates pushes to `main` and pull requests targeting `main`.
 
 ## Packaging
 
@@ -104,6 +124,6 @@ This repository uses a flat package layout where the package root is the project
 ## Recommended Next Steps
 
 - Split non-X-specific browser helpers into a reusable internal module if another platform adapter is added.
-- Keep automated tests on `labui-testing`, or add a small core-only test set back to `main` if the downstream integration path needs it.
-- Keep the runtime smoke tests in `main`; they now cover sync lifecycle behavior and soft-failure diagnostics without launching a real browser.
+- Keep focused core regression tests in `main`, especially for target identity, origin checks, at-most-once writes, lifecycle cleanup, and synchronous serialization.
+- Add an opt-in real-browser selector-contract job that uses a disposable, non-authenticated profile; authenticated mutation coverage must remain an explicitly controlled environment.
 - Introduce semantic version tags once the API is stable enough for third-party consumers.

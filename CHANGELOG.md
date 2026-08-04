@@ -4,6 +4,14 @@ Use this file for the next feature or release notes.
 
 ## Unreleased
 
+- Harden browser boundaries and mutation safety: restrict action surfaces to trusted X origins, require exact status/article identity, remove DOM/force-click fallbacks, fail closed on content-kind mismatches, and avoid replaying ambiguous write triggers.
+- Validate controller settings (including unknown mapping keys) and public handles/limits before browser work, bound read results exactly, filter out-of-window mentions, and improve closed-page health reporting and cleanup.
+- Serialize synchronous facade calls with finite configurable timeouts, poison the facade after an outcome-ambiguous timeout, make shutdown cancellation-aware, and add complete follow/unfollow parity.
+- Make debug snapshots manifest-only by default with explicit sensitive-content opt-in, and prevent snapshots or media capture from silently replacing existing artifacts.
+- Keep newly surfaced quote and quote-cleanup hooks non-abstract so existing `SocialPlatformAdapter` subclasses remain compatible in 0.1.x.
+- Align branch and CI documentation with `main` as the only published long-lived branch.
+- Make tests load the current checkout hermetically from arbitrary worktree names and add focused safety regressions for browser, write, read, settings, lifecycle, and sync behavior.
+- Use the bundled Chromium user agent by default instead of a stale hard-coded browser version, while retaining an explicit override, and treat mouse-move timing as milliseconds rather than a Playwright step count.
 - Issue #12: harden browser diagnostics by centralizing `ActionResult.failure_stage` taxonomy, adding structured parser-warning capture for read fallbacks, and enriching unknown-id submission confirmations for reply/quote flows.
 - Refactor the former monolithic `adapter.py` into cohesive internal modules:
   `_adapter_runtime.py`, `_adapter_read.py`, and `_adapter_write.py` while keeping

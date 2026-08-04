@@ -1,46 +1,45 @@
 # Branching Workflow
 
-This repository uses two long-lived branches with different responsibilities.
+This repository uses `main` as its single long-lived, releasable branch. Work is isolated on short-lived branches and merged through focused pull requests.
 
 ## Branch Roles
 
 - `main`
-  Clean integration branch. Keep only the reusable controller package, packaging files, and docs here.
-- `labui-testing`
-  Development branch for `lab_ui`, `lab_api`, manual walkthrough tooling, and automated tests.
+  Releasable source of truth for the controller package, tests, packaging files, and documentation.
+- Short-lived feature or fix branches
+  One scoped change per branch. Keep tests and documentation with the implementation they validate.
 
-The downstream project should update from `main`, not from `labui-testing`.
+Downstream projects should update from `main` or a release tag, not from a development branch.
 
 ## Daily Workflow
 
-Sync `main` first:
+Refresh the remote state and branch from `origin/main`:
 
 ```bash
-git switch main
-git pull origin main
+git fetch origin
+git switch -c <feature-branch> origin/main
 ```
 
-Refresh the lab branch from the clean core branch:
+Before opening or updating a pull request, rebase the focused branch on the latest `main` and run the local CI gates:
 
 ```bash
-git switch labui-testing
-git rebase main
+git fetch origin
+git rebase origin/main
+python -m ruff check .
+python -W error -m pytest -q
 ```
 
-Do lab UI and test work on `labui-testing`.
-
-When a controller fix from `labui-testing` should ship to consumers, move only the relevant commit(s) back to `main`:
+Push the branch and open a pull request targeting `main`:
 
 ```bash
-git switch main
-git cherry-pick <commit-sha>
+git push -u origin <feature-branch>
 ```
 
-Avoid merging `labui-testing` into `main` as a full branch merge. A full merge would reintroduce `lab_ui`, `lab_api`, and test-only files into the clean branch.
+Do not commit persistent browser profiles, credentials, diagnostic snapshots, captured media, build output, or unrelated local changes.
 
 ## Suggested Rules
 
 - Keep `main` fast-forwardable and releasable at all times.
-- Treat `labui-testing` as disposable development support for the core package.
-- If a change belongs only to manual validation or local experimentation, keep it on `labui-testing`.
+- Delete merged feature branches when they are no longer needed.
+- Keep local experiments out of a pull request unless they are intentional, maintained project assets.
 - Tag releases from `main` after CI passes.

@@ -31,13 +31,23 @@ class HumanMotion:
         viewport = page.viewport_size or {"width": 1365, "height": 768}
         x = random.randint(0, viewport["width"])
         y = random.randint(0, viewport["height"])
-        await page.mouse.move(x, y, steps=self.settings.anti_bot_mouse_move_ms)
+        duration_ms = max(0, self.settings.anti_bot_mouse_move_ms)
+        steps = max(1, min(120, round(duration_ms / 16)))
+        await page.mouse.move(x, y, steps=steps)
+        if duration_ms:
+            await asyncio.sleep(duration_ms / 1000.0)
         await self.jitter(20, 180)
 
     async def wait_for_network_idle(self, page, ms: int = 900) -> None:
         try:
             await page.wait_for_load_state("networkidle", timeout=ms)
-        except Exception:
+        except Exception as exc:
+            # Network-idle timeouts are expected on X's continuously active
+            # pages.  Browser/context closure and transport failures are not:
+            # callers need those errors in order to recover the runtime.
+            error_text = f"{type(exc).__name__}: {exc}".lower()
+            if "timeout" not in error_text:
+                raise
             await self.jitter(ms, ms + 500)
 
     def pick_weighted(self, options: dict[str, float]) -> str:

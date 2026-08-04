@@ -4,7 +4,7 @@
 
 It is designed for reuse from scripts and services instead of a single hard-coded workflow.
 
-`main` is the clean integration branch for downstream projects. Lab UI, lab API, and test-harness work live on `labui-testing`.
+`main` is the clean integration branch for downstream projects. Development work uses short-lived branches and focused pull requests.
 
 ## What It Supports
 
@@ -16,8 +16,8 @@ It is designed for reuse from scripts and services instead of a single hard-code
 - Image attachments for new posts, replies, and quote posts
 - Post media capture for downstream media analysis
 - Synchronous service facade for non-async runtimes
-- Verified delete flows for own posts, replies, and reposts
-- Bulk cleanup helpers for posts, replies, reposts, or all content
+- Verified delete flows for own posts, replies, quotes, and reposts
+- Bulk cleanup helpers for posts, replies, quotes, reposts, or all content
 - Post metric scraping
 
 ## Installation
@@ -116,32 +116,44 @@ Compatibility notes:
 
 ## Branch Workflow
 
-- `main`: reusable controller package only. This is the branch the downstream project should pull from.
-- `labui-testing`: manual UI/API tooling and test-only work. Keep it rebased on `main`.
-- When a core fix is developed on `labui-testing`, cherry-pick or open a focused PR back into `main`. Do not merge the branch wholesale or the lab/test files come back.
+- `main`: releasable controller package and the branch downstream projects should consume.
+- Use a short-lived branch for each focused change, keep it current with `origin/main`, and merge it through review after CI passes.
+- Keep credentials, persistent browser profiles, local diagnostics, and generated artifacts out of every branch.
 
 See [Branching workflow](docs/BRANCHING.md) for the exact commands.
 
 ## Notes For Reuse
 
 - The controller is stateful and intended to be reused across multiple actions inside one started session.
+- Public async workflows on one controller instance are serialized because they share one stateful page. Create separate controller/profile instances for intentional parallelism.
+- The library does not expose a command-line interface; use the async adapter or synchronous facade from Python.
 - Most flows prefer UI clicks and only fall back to direct URL navigation when recovery is needed.
+- Navigation and action surfaces are restricted to HTTPS pages on `x.com` and `www.x.com`.
 - Sync Playwright fallback is preferred on Windows to avoid event-loop/subprocess issues.
 - Set `ControllerSettings(headless=True)` to launch Chromium without a visible window. Keep the default visible mode for manual login and debugging.
-- Methods that mutate state should be treated as best-effort browser automation, not transactional API calls.
+- Methods that mutate state are browser automation, not transactional API calls. Detailed results distinguish a confirmed result from an ambiguous submit outcome, and an ambiguous write trigger is not automatically replayed.
 - `controller.last_action_error` records the latest soft UI failure with action, URL, selector summary, and message.
 - Set `ControllerSettings(strict_ui_failures=True)` when you want soft UI failures to raise `UIActionError` instead of returning `False` or an empty result.
 - Use the `*_detailed()` write methods, `preflight_action()`, `read_timeline_detailed()`, `attach_images_preflight()`, `debug_snapshot()`, and `health_check()` for long-running service integrations that need structured diagnostics.
-- Use `SyncXController` when a service needs synchronous calls without owning an event-loop thread or coroutine bridge.
+- Use `SyncXController` when a service needs synchronous calls without owning an event-loop thread or coroutine bridge. Its calls are serialized and bounded by `call_timeout_seconds` (120 seconds by default); shutdown uses `close_timeout_seconds` (10 seconds by default). A timed-out call poisons that facade because the browser-side outcome is unknown. An in-flight synchronous Playwright call cannot be forcibly stopped in-process, so a service that must guarantee profile-lock release should isolate the controller in a restartable worker process.
+- Call `adapter.sync()` only before starting that adapter. Wrapping an already-started async browser would cross event-loop ownership and is rejected.
 - Use `login_state()` for passive login detection without importing selector internals.
-- Use `capture_post_media()` to create local artifacts for image cards and representative video frames attached to a post.
+- Use `capture_post_media(..., overwrite=False)` to create local artifacts for image cards and representative video frames attached to a post. Existing capture names are refused by default; replacing them requires explicit opt-in.
 - Use `settle_after_action(tab="for_you", force_refresh=..., reset_scroll=...)` when a service needs a known home surface after a write/action flow.
 - Use `account_stats(handle=None)` to sample public profile-level counts and metadata. It opens a temporary page when possible so periodic sampling does not move the controller's active feed page.
 - Set `ControllerSettings(playwright_mode="async")`, `playwright_mode="sync"`, or `prefer_sync_playwright=True/False` when the embedding service needs explicit Playwright transport ownership. The synchronous facade controls the caller contract separately.
+- Set `ControllerSettings(expected_account_handle="your_handle")` to make every mutation fail closed unless the active persistent profile can be verified as that account.
+- Mutations are blocked while login is required, an account-lock or blocking modal is visible, or a scoped X system message reports rate limiting. A detected rate limit starts a local cooldown controlled by `rate_limit_cooldown_seconds` (300 seconds by default).
+
+## Credential and Artifact Boundary
+
+XController never accepts an X password or authentication token. Authentication lives in the persistent Chromium profile supplied by `profile_path`; protect that directory as credential material and never commit or share it. The repository ignores `data/profiles/` by default.
+
+`debug_snapshot()` writes only a redacted JSON manifest by default. Passing `include_sensitive_content=True` additionally writes page HTML, a screenshot, visible dialogs, and article summaries. Snapshot targets and generated media-capture names are not replaced unless `overwrite=True`; symlink targets are refused. Treat opted-in snapshots and captured media as sensitive, choose a private location, and remove artifacts according to your retention policy. Do not point artifact output at a tracked source directory.
 
 ## CI/CD
 
-GitHub Actions should validate `main` before the downstream project updates from it. The included workflow performs install/import/build checks on both `main` and `labui-testing`, and runs the `tests/` suite with `unittest` discovery only when tests exist on the branch.
+GitHub Actions should validate `main` before the downstream project updates from it. The included workflow runs Ruff, executes the `tests/` suite with pytest and warnings treated as errors, builds both distributions, then installs the wheel and smoke-tests the public package surface on Linux and Windows.
 
 See [CI/CD instructions](docs/CI_CD.md) for the release and update flow.
 

@@ -4,11 +4,12 @@ on:
   push:
     branches:
       - main
-      - labui-testing
   pull_request:
     branches:
       - main
-      - labui-testing
+
+permissions:
+  contents: read
 
 jobs:
   verify:
@@ -88,21 +89,28 @@ jobs:
           assert XControllerClass
           PY
 
+      - name: Lint source and tests
+        run: python -m ruff check .
+
+      - name: Run tests with warnings as errors
+        run: python -W error -m pytest -q
+
       - name: Build package artifacts
         run: python -m build
 
-      - name: Run unittest suite when present
+      - name: Install and smoke test built wheel
         shell: bash
         run: |
+          python -m pip uninstall -y XController
+          python -m pip install --no-deps dist/*.whl
           python - <<'PY'
-          import subprocess
-          import sys
-          from pathlib import Path
+          from importlib.resources import files
 
-          tests_dir = Path("tests")
-          has_tests = tests_dir.is_dir() and any(tests_dir.glob("test_*.py"))
-          if has_tests:
-              subprocess.check_call([sys.executable, "-m", "unittest", "discover", "-s", "tests", "-p", "test_*.py"])
-          else:
-              print("No tests on this branch.")
+          import XController
+          from XController import ControllerSettings, SyncXController
+
+          assert XController.__version__
+          assert ControllerSettings
+          assert SyncXController
+          assert files("XController").joinpath("py.typed").is_file()
           PY

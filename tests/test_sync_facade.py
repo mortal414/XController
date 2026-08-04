@@ -1,15 +1,27 @@
 from __future__ import annotations
 
+import importlib.util
 from pathlib import Path
 import sys
 import unittest
 
-repo_root = Path(__file__).resolve().parents[1]
-repo_parent = repo_root.parent
-if str(repo_parent) not in sys.path:
-    sys.path.insert(0, str(repo_parent))
-
-from XController import ActionResult, LoginState, SyncXController, TimelineReadResult
+try:
+    from XController import ActionResult, LoginState, SyncXController, TimelineReadResult
+except ModuleNotFoundError as exc:
+    if exc.name != "XController":
+        raise
+    repo_root = Path(__file__).resolve().parents[1]
+    spec = importlib.util.spec_from_file_location(
+        "XController",
+        repo_root / "__init__.py",
+        submodule_search_locations=[str(repo_root)],
+    )
+    if spec is None or spec.loader is None:
+        raise
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["XController"] = module
+    spec.loader.exec_module(module)
+    from XController import ActionResult, LoginState, SyncXController, TimelineReadResult
 
 
 class FakeAsyncAdapter:

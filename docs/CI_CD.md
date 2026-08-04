@@ -1,32 +1,32 @@
 # CI/CD Instructions
 
-This repository should validate the clean package branch before any downstream project pulls from it.
+This repository validates its releasable branch before any downstream project pulls from it.
 
 ## CI
 
 Use the GitHub Actions workflow at `.github/workflows/ci.yml`.
 
-It is intended to run on pushes and pull requests for:
+The published repository has one long-lived branch, `main`. CI should run for pushes to `main` and pull requests targeting `main`; short-lived feature branches are validated through their pull requests.
 
-- `main`
-- `labui-testing`
+The workflow performs the following checks on both `ubuntu-latest` and `windows-latest`:
 
-The workflow does three things on both `ubuntu-latest` and `windows-latest`:
-
-- installs the project with whatever extras are defined on that branch
-- runs an import smoke test for the public package
+- installs the project with its development dependencies
+- lints the complete tree with Ruff
+- runs the test suite with warnings promoted to errors
 - builds the wheel and sdist
+- installs the built wheel and smoke-tests the public imports and `py.typed` marker
 
-If the branch contains a `tests/` directory, it also runs the suite with:
+Run the same source-tree test gate locally with:
 
 ```bash
-python -m unittest discover -s tests -p "test_*.py"
+python -m ruff check .
+python -W error -m pytest -q
 ```
 
 That means:
 
 - `main` gets package-level verification on both Linux and Windows, including the sync-runtime test coverage that matters most for Windows consumers
-- `labui-testing` can run the broader validation stack when those files exist there
+- pull requests get the same validation before merge
 
 ## CD
 
@@ -41,10 +41,10 @@ python -m pip install --upgrade pip build
 python -m build
 ```
 
-4. Tag the release from `main`:
+4. Tag the release from `main`, substituting the version being released:
 
 ```bash
-git tag v0.1.0
+git tag v<version>
 git push origin main --tags
 ```
 
@@ -52,6 +52,6 @@ git push origin main --tags
 
 ## Practical Policy
 
-- Do not deploy from `labui-testing`.
-- Do not merge `labui-testing` into `main` wholesale.
+- Do not deploy from an unreviewed feature branch.
+- Prefer focused, reviewable pull requests over long-lived integration branches.
 - Use `main` as the source of truth for anything another repository imports.
