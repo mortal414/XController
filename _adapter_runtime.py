@@ -4,12 +4,12 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import asyncio
-import contextlib
+import inspect
 import logging
 import os
 import random
 import re
+import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
 from functools import partial
@@ -40,12 +40,20 @@ ImagePathInput = ImagePath | Sequence[ImagePath]
 
 class _AdapterRuntimeMixin:
     """Runtime lifecycle and UI interaction primitives shared across adapter concerns."""
+
+    TRUSTED_X_HOSTS = frozenset({"x.com", "www.x.com"})
+    NEUTRAL_PAGE_URLS = frozenset({"", "about:blank"})
+
     def __init__(self, profile_path: str, settings: Any | None = None, proxy: str | None = None):
         self.settings = ControllerSettings.from_any(settings)
+        if profile_path is None or not str(profile_path).strip():
+            raise ValueError("profile_path must be a non-empty path")
         profile_dir = Path(profile_path).expanduser()
         if not profile_dir.is_absolute():
             profile_dir = (Path.cwd() / profile_dir).resolve()
         profile_dir.mkdir(parents=True, exist_ok=True)
+        with contextlib.suppress(OSError):
+            os.chmod(profile_dir, 0o700)
         self.profile_path = str(profile_dir)
         self.proxy = proxy
         self.playwright = None
@@ -63,16 +71,64 @@ class _AdapterRuntimeMixin:
         self.last_action_error: ActionFailureInfo | None = None
         self._recent_parser_warnings: list[dict[str, str]] = []
         self._recent_parser_warning_limit = 25
+        self._operation_lock = asyncio.Lock()
+        self._operation_owner: asyncio.Task[Any] | None = None
+        self._operation_depth = 0
+        self._locator_binding_prefix = (
+            f"xcontroller-{time.monotonic_ns():x}-{random.getrandbits(32):08x}"
+        )
+        self._locator_binding_counter = 0
         self.human = HumanMotion(self.settings)
+
+    @contextlib.asynccontextmanager
+    async def _serialized_operation(self):
+        """Serialize public workflows while allowing intentional nested calls."""
+        task = asyncio.current_task()
+        if task is None:
+            raise RuntimeError("controller_operation_requires_async_task")
+        if self._operation_owner is task:
+            self._operation_depth += 1
+            try:
+                yield
+            finally:
+                self._operation_depth -= 1
+            return
+
+        await self._operation_lock.acquire()
+        self._operation_owner = task
+        self._operation_depth = 1
+        try:
+            yield
+        finally:
+            self._operation_depth = 0
+            self._operation_owner = None
+            self._operation_lock.release()
 
     async def start(self) -> None:
         """Start the Playwright runtime used by this adapter instance."""
         if self.context:
-            return
+            try:
+                if await self._page_is_safe_for_navigation(self.page):
+                    return
+                await self._refresh_page_handle()
+                if await self._page_is_safe_for_navigation(self.page):
+                    return
+            except Exception as exc:
+                logger.warning("Existing browser context is unusable; restarting. error=%s", str(exc)[:280])
+            await self._hard_reset_browser_state()
         if self._sync_page:
             self.context = self._sync_context  # type: ignore[assignment]
             self.page = self._sync_page  # type: ignore[assignment]
-            return
+            self._sync_mode = True
+            try:
+                if await self._page_is_safe_for_navigation(self.page):
+                    return
+                await self._refresh_page_handle()
+                if await self._page_is_safe_for_navigation(self.page):
+                    return
+            except Exception as exc:
+                logger.warning("Existing sync browser context is unusable; restarting. error=%s", str(exc)[:280])
+            await self._hard_reset_browser_state()
 
         start_retries = 3
         for attempt in range(1, start_retries + 1):
@@ -102,17 +158,17 @@ class _AdapterRuntimeMixin:
                     context_kwargs: dict[str, Any] = {
                         "headless": bool(self.settings.headless),
                         "viewport": viewport,
-                        "user_agent": self.settings.default_user_agent,
-                        "args": ["--disable-blink-features=AutomationControlled"],
                     }
+                    if self.settings.default_user_agent:
+                        context_kwargs["user_agent"] = self.settings.default_user_agent
                     if self.proxy:
                         context_kwargs["proxy"] = {"server": self.proxy}
                     self.context = await self.playwright.chromium.launch_persistent_context(
                         user_data_dir=self.profile_path,
                         **context_kwargs,
                     )
-                    self.page = self.context.pages[0] if self.context.pages else await self.context.new_page()
                     self._sync_mode = False
+                    await self._refresh_page_handle()
                     await self._wait_network_idle(1800)
                     return
 
@@ -164,9 +220,9 @@ class _AdapterRuntimeMixin:
         context_kwargs: dict[str, Any] = {
             "headless": bool(self.settings.headless),
             "viewport": viewport,
-            "user_agent": self.settings.default_user_agent,
-            "args": ["--disable-blink-features=AutomationControlled"],
         }
+        if self.settings.default_user_agent:
+            context_kwargs["user_agent"] = self.settings.default_user_agent
         if self.proxy:
             context_kwargs["proxy"] = {"server": self.proxy}
         await self._run_sync(self._start_sync_browser, context_kwargs)
@@ -202,13 +258,30 @@ class _AdapterRuntimeMixin:
             self._sync_playwright = None
             self._sync_context = None
             self._sync_page = None
-        logger.info("Starting Playwright sync fallback for profile_path=%s", self.profile_path)
+        logger.info("Starting Playwright sync fallback")
         self._sync_playwright = sync_playwright().start()
         self._sync_context = self._sync_playwright.chromium.launch_persistent_context(
             user_data_dir=self.profile_path,
             **context_kwargs,
         )
-        self._sync_page = self._sync_context.pages[0] if self._sync_context.pages else self._sync_context.new_page()
+        self._sync_page = self._select_or_create_sync_page()
+
+    def _select_or_create_sync_page(self) -> SyncPage:
+        if not self._sync_context:
+            raise RuntimeError("Browser context not started")
+        neutral_page: SyncPage | None = None
+        for candidate in self._sync_context.pages:
+            try:
+                if candidate.is_closed():
+                    continue
+                url = str(candidate.url or "")
+            except Exception:
+                continue
+            if self._is_trusted_x_url(url):
+                return candidate
+            if neutral_page is None and self._is_neutral_page_url(url):
+                neutral_page = candidate
+        return neutral_page or self._sync_context.new_page()
 
     async def _run_sync(self, func: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
         if self._executor is None:
@@ -290,11 +363,11 @@ class _AdapterRuntimeMixin:
             return "unknown"
 
     async def _active_home_tab(self) -> str:
-        if not self.page:
+        if not self.page or not await self._page_is_trusted(self.page):
             return ""
         try:
             value = await self._evaluate(
-                """() => {
+                r"""() => {
                     const normalize = text => String(text || '').toLowerCase().replace(/\s+/g, ' ').trim();
                     const tabs = Array.from(document.querySelectorAll('[role="tab"], a[aria-current="page"]'));
                     for (const tab of tabs) {
@@ -331,6 +404,8 @@ class _AdapterRuntimeMixin:
         """Return the synchronous service facade for this adapter instance."""
         from .sync import SyncXController
 
+        if self.context or self.page or self._sync_context or self._sync_page:
+            raise RuntimeError("sync_facade_requires_unstarted_adapter")
         return SyncXController(adapter=self)
 
     async def _fill_action_context(self, result: ActionResult) -> ActionResult:
@@ -364,7 +439,7 @@ class _AdapterRuntimeMixin:
             created_post_id=created_post_id,
             target_url=f"{self.BASE_URL}/i/web/status/{post_id}" if post_id else "",
             failure_reason=failure_reason or ("unknown_failure" if not ok else ""),
-            failure_stage=failure_stage or (ActionFailureStage.UNKNOWN if not ok else ""),
+            failure_stage="" if ok else (failure_stage or ActionFailureStage.UNKNOWN),
             attempts=attempts,
             media_paths=list(media_paths or []),
             diagnostic=dict(diagnostic or {}),
@@ -393,44 +468,59 @@ class _AdapterRuntimeMixin:
             return
         try:
             page.wait_for_load_state("networkidle", timeout=ms)
-        except Exception:
-            pass
+        except Exception as exc:
+            if "timeout" in str(exc).lower() or "timeout" in type(exc).__name__.lower():
+                return
+            raise
 
     async def close(self) -> None:
         """Close the Playwright runtime used by this adapter instance."""
-        if self.context:
-            if self._sync_mode:
+        first_error: Exception | None = None
+        async_context = self.context if not self._sync_mode else None
+        async_playwright_instance = self.playwright
+        has_sync_runtime = bool(
+            self._sync_mode or self._sync_context or self._sync_page or self._sync_playwright
+        )
+        try:
+            if async_context:
+                try:
+                    await async_context.close()
+                except Exception as exc:
+                    first_error = exc
+
+            if has_sync_runtime:
                 try:
                     await self._run_sync(self._close_sync_browser)
                 except RuntimeError as exc:
-                    if str(exc) not in {"target_page_or_context_closed", "playwright_driver_connection_closed", "profile_in_use"}:
-                        raise
-            else:
-                await self.context.close()
-                self.context = None
-                self.page = None
-                if self.playwright:
-                    await self.playwright.stop()
-                    self.playwright = None
-                self._sync_mode = False
-                self._shutdown_executor()
-                return
+                    ignored = {
+                        "target_page_or_context_closed",
+                        "playwright_driver_connection_closed",
+                        "profile_in_use",
+                    }
+                    if str(exc) not in ignored and first_error is None:
+                        first_error = exc
+                except Exception as exc:
+                    if first_error is None:
+                        first_error = exc
+
+            if async_playwright_instance:
+                try:
+                    await async_playwright_instance.stop()
+                except Exception as exc:
+                    if first_error is None:
+                        first_error = exc
+        finally:
             self.context = None
             self.page = None
+            self.playwright = None
+            self._sync_context = None
+            self._sync_page = None
+            self._sync_playwright = None
             self._sync_mode = False
             self._shutdown_executor()
-            return
 
-        if self.playwright:
-            await self.playwright.stop()
-            self.playwright = None
-        if self._sync_playwright:
-            try:
-                await self._run_sync(self._close_sync_browser)
-            except RuntimeError as exc:
-                if str(exc) not in {"target_page_or_context_closed", "playwright_driver_connection_closed", "profile_in_use"}:
-                    raise
-        self._shutdown_executor()
+        if first_error is not None:
+            raise first_error
 
     def _close_sync_browser(self) -> None:
         if self._sync_context:
@@ -484,57 +574,12 @@ class _AdapterRuntimeMixin:
 
     async def _click(self, locator: Any) -> None:
         if self._sync_mode:
-            await self._run_sync(self._click_sync, locator)
+            await self._run_sync(locator.click, timeout=3500)
             return
-        try:
-            await locator.click(timeout=3500)
-        except Exception:
-            await locator.evaluate("el => el.click()")
+        await locator.click(timeout=3500)
 
     def _click_sync(self, locator: Any) -> None:
-        try:
-            locator.click(timeout=3500)
-        except Exception:
-            locator.evaluate("el => el.click()")
-
-    async def _click_force(self, locator: Any) -> None:
-        if self._sync_mode:
-            await self._run_sync(self._click_force_sync, locator)
-            return
-        try:
-            await locator.click(timeout=2200, force=True)
-            return
-        except Exception:
-            pass
-        try:
-            await locator.dispatch_event("click")
-            return
-        except Exception:
-            pass
-        await locator.evaluate(
-            """el => {
-                el.scrollIntoView({block: 'center', inline: 'center', behavior: 'instant'});
-                el.click();
-            }"""
-        )
-
-    def _click_force_sync(self, locator: Any) -> None:
-        try:
-            locator.click(timeout=2200, force=True)
-            return
-        except Exception:
-            pass
-        try:
-            locator.dispatch_event("click")
-            return
-        except Exception:
-            pass
-        locator.evaluate(
-            """el => {
-                el.scrollIntoView({block: 'center', inline: 'center', behavior: 'instant'});
-                el.click();
-            }"""
-        )
+        locator.click(timeout=3500)
 
     async def _type_text(self, element: Any, text: str) -> None:
         if not text:
@@ -580,7 +625,10 @@ class _AdapterRuntimeMixin:
     async def _find_media_input_for_composer(self, textbox: Any | None, timeout_ms: int = 3000) -> Any | None:
         deadline = time.monotonic() + (max(0, timeout_ms) / 1000.0)
         while True:
-            for scope in await self._composer_scopes_for_textbox(textbox):
+            for scope in await self._composer_scopes_for_textbox(
+                textbox,
+                include_page=textbox is None,
+            ):
                 for selector in ui.MEDIA_INPUT_SELECTORS:
                     with contextlib.suppress(Exception):
                         locator = scope.locator(selector)
@@ -594,7 +642,7 @@ class _AdapterRuntimeMixin:
         deadline = time.monotonic() + max(1.0, timeout_seconds)
         while time.monotonic() < deadline:
             scopes = await self._composer_scopes_for_textbox(textbox, include_page=False)
-            if not scopes and self.page:
+            if not scopes and textbox is None and self.page:
                 scopes = [self.page]
             for scope in scopes:
                 for selector in ui.MEDIA_PREVIEW_SELECTORS:
@@ -703,7 +751,11 @@ class _AdapterRuntimeMixin:
         viewport = self._sync_page.viewport_size or {"width": 1365, "height": 768}
         x = random.randint(0, viewport["width"])
         y = random.randint(0, viewport["height"])
-        self._sync_page.mouse.move(x, y, steps=self.settings.anti_bot_mouse_move_ms)
+        duration_ms = max(0, self.settings.anti_bot_mouse_move_ms)
+        steps = max(1, min(120, round(duration_ms / 16)))
+        self._sync_page.mouse.move(x, y, steps=steps)
+        if duration_ms:
+            time.sleep(duration_ms / 1000.0)
         time.sleep(random.uniform(20, 180) / 1000.0)
 
     async def _page_content(self) -> str:
@@ -766,20 +818,31 @@ class _AdapterRuntimeMixin:
                 await self._run_sync(page.wait_for_load_state, "networkidle", timeout=ms)
             else:
                 await page.wait_for_load_state("networkidle", timeout=ms)
-        except Exception:
-            pass
+        except Exception as exc:
+            if "timeout" in str(exc).lower() or "timeout" in type(exc).__name__.lower():
+                return
+            raise
 
     async def _page_goto(self, page: Any, url: str) -> None:
+        target_url = self._normalize_trusted_x_url(url)
+        if not target_url:
+            raise ValueError("navigation_url_must_use_trusted_x_origin")
+        if not await self._page_is_safe_for_navigation(page):
+            raise RuntimeError("unsafe_navigation_page")
         retries = max(1, int(self.NAV_RETRIES))
         last_exc: Exception | None = None
         for attempt in range(1, retries + 1):
             try:
                 if self._sync_mode:
-                    await self._run_sync(page.goto, url, wait_until="domcontentloaded")
+                    await self._run_sync(page.goto, target_url, wait_until="domcontentloaded")
                 else:
-                    await page.goto(url, wait_until="domcontentloaded")
+                    await page.goto(target_url, wait_until="domcontentloaded")
                 await self.human.jitter(300, 900)
                 await self._page_wait_network_idle(page, 1400)
+                current_url = await self._page_url(page)
+                if not self._normalize_trusted_x_url(current_url):
+                    self._detach_active_page(page)
+                    raise RuntimeError("navigation_left_trusted_x_origin")
                 return
             except Exception as exc:
                 last_exc = exc
@@ -787,7 +850,7 @@ class _AdapterRuntimeMixin:
                     "page_navigation_failed attempt=%s/%s url=%s error=%s",
                     attempt,
                     retries,
-                    url,
+                    self._redact_url_for_log(target_url),
                     str(exc)[:300],
                 )
                 if attempt >= retries or not self._is_retryable_error(exc):
@@ -856,31 +919,52 @@ class _AdapterRuntimeMixin:
     async def _refresh_page_handle(self) -> None:
         if not self.context:
             return
-        if self.context.pages:
-            self.page = self.context.pages[0]
-            return
         if self._sync_mode:
             if not self._sync_context:
+                self.page = None
+                self._sync_page = None
                 return
-            self.page = await self._run_sync(self._sync_context.new_page)
-        else:
-            self.page = await self.context.new_page()
+            selected = await self._run_sync(self._select_or_create_sync_page)
+            self._sync_page = selected
+            self.page = selected  # type: ignore[assignment]
+            return
+
+        neutral_page: Any | None = None
+        for candidate in list(self.context.pages):
+            if await self._page_is_closed(candidate):
+                continue
+            candidate_url = await self._page_url(candidate)
+            if self._is_trusted_x_url(candidate_url):
+                self.page = candidate
+                return
+            if neutral_page is None and self._is_neutral_page_url(candidate_url):
+                neutral_page = candidate
+        self.page = neutral_page or await self.context.new_page()
 
     async def _goto(self, url: str) -> None:
+        target_url = self._normalize_trusted_x_url(url)
+        if not target_url:
+            raise ValueError("navigation_url_must_use_trusted_x_origin")
         retries = max(1, int(self.NAV_RETRIES))
         last_exc: Exception | None = None
         for attempt in range(1, retries + 1):
             try:
+                if self.page and not await self._page_is_safe_for_navigation(self.page):
+                    self._detach_active_page(self.page)
                 if not self.page:
                     await self._refresh_page_handle()
                 if not self.page:
                     raise RuntimeError("Browser context not started")
+                page = self.page
                 if self._sync_mode:
-                    await self._run_sync(self._sync_page.goto, url, wait_until="domcontentloaded")
+                    await self._run_sync(page.goto, target_url, wait_until="domcontentloaded")
                 else:
-                    await self.page.goto(url, wait_until="domcontentloaded")
+                    await page.goto(target_url, wait_until="domcontentloaded")
                 await self.human.jitter(300, 900)
                 await self._wait_network_idle(1400)
+                if not await self._page_is_trusted(page):
+                    self._detach_active_page(page)
+                    raise RuntimeError("navigation_left_trusted_x_origin")
                 return
             except Exception as exc:
                 last_exc = exc
@@ -888,7 +972,7 @@ class _AdapterRuntimeMixin:
                     "navigation_failed attempt=%s/%s url=%s error=%s",
                     attempt,
                     retries,
-                    url,
+                    self._redact_url_for_log(target_url),
                     str(exc)[:300],
                 )
                 if attempt >= retries or not self._is_retryable_error(exc):
@@ -907,19 +991,32 @@ class _AdapterRuntimeMixin:
     async def _go_back(self) -> None:
         if not self.page:
             return
+        if not await self._page_is_trusted(self.page):
+            raise RuntimeError("unsafe_navigation_page")
         back_btn = await self._find_first(ui.BACK_BUTTONS, timeout_ms=900)
         if back_btn:
-            with contextlib.suppress(Exception):
+            try:
                 await self._click(back_btn)
                 await self.human.jitter(250, 700)
                 await self._wait_network_idle(1100)
-                return
+            except Exception:
+                pass
+            else:
+                if await self._page_is_trusted(self.page):
+                    return
+                page = self.page
+                self._detach_active_page(page)
+                raise RuntimeError("navigation_left_trusted_x_origin")
         if self._sync_mode:
             await self._run_sync(self._sync_page.go_back, wait_until="domcontentloaded")
         else:
             await self.page.go_back(wait_until="domcontentloaded")
         await self.human.jitter(250, 700)
         await self._wait_network_idle(1100)
+        if self.page and not await self._page_is_trusted(self.page):
+            page = self.page
+            self._detach_active_page(page)
+            raise RuntimeError("navigation_left_trusted_x_origin")
 
     async def _keyboard_press(self, shortcut: str) -> None:
         if not self.page:
@@ -929,8 +1026,39 @@ class _AdapterRuntimeMixin:
         else:
             await self.page.keyboard.press(shortcut)
 
+    def _normalize_trusted_x_url(self, value: Any) -> str:
+        raw = str(value or "").strip()
+        if not raw:
+            return ""
+        if raw.startswith("/"):
+            raw = f"{self.BASE_URL}{raw}"
+        try:
+            parsed = urlparse(raw)
+            port = parsed.port
+        except (TypeError, ValueError):
+            return ""
+        if parsed.scheme.lower() != "https":
+            return ""
+        if (parsed.hostname or "").lower() not in {"x.com", "www.x.com"}:
+            return ""
+        if parsed.username or parsed.password or port not in {None, 443}:
+            return ""
+        return raw
+
+    def _redact_url_for_log(self, value: Any) -> str:
+        trusted = self._normalize_trusted_x_url(value)
+        if not trusted:
+            return "<untrusted-url>"
+        parsed = urlparse(trusted)
+        return parsed._replace(query="", fragment="").geturl()
+
     def _normalize_post_id(self, value: Any) -> str:
-        match = self.POST_ID_RE.search(str(value or ""))
+        raw = str(value or "").strip()
+        if self.POST_ID_RE.fullmatch(raw):
+            return raw
+        if not self._is_trusted_x_url(raw):
+            return ""
+        match = re.search(r"/status/([0-9]+)(?=$|/)", urlparse(raw).path)
         return match.group(1) if match else ""
 
     def _normalize_username(self, username: str) -> str:
@@ -945,14 +1073,57 @@ class _AdapterRuntimeMixin:
         return handle
 
     def _profile_handle_from_url(self, url: str) -> str:
+        trusted_url = self._normalize_trusted_x_url(url)
+        if not trusted_url:
+            return ""
         try:
-            parsed = urlparse(str(url or ""))
+            parsed = urlparse(trusted_url)
         except Exception:
             return ""
         parts = [part for part in parsed.path.split("/") if part]
         if not parts:
             return ""
         return self._normalize_account_handle(parts[0])
+
+    def _is_trusted_x_url(self, value: Any) -> bool:
+        raw = str(value or "").strip()
+        return bool(raw and not raw.startswith("/") and self._normalize_trusted_x_url(raw))
+
+    def _is_neutral_page_url(self, value: Any) -> bool:
+        return str(value or "").strip().lower() in self.NEUTRAL_PAGE_URLS
+
+    async def _page_is_closed(self, page: Any | None) -> bool:
+        if page is None:
+            return True
+        checker = getattr(page, "is_closed", None)
+        if not callable(checker):
+            return False
+        try:
+            if self._sync_mode:
+                return bool(await self._run_sync(checker))
+            result = checker()
+            if inspect.isawaitable(result):
+                result = await result
+            return bool(result)
+        except Exception:
+            return True
+
+    async def _page_is_safe_for_navigation(self, page: Any | None) -> bool:
+        if await self._page_is_closed(page):
+            return False
+        url = await self._page_url(page)
+        return self._is_trusted_x_url(url) or self._is_neutral_page_url(url)
+
+    async def _page_is_trusted(self, page: Any | None) -> bool:
+        if await self._page_is_closed(page):
+            return False
+        return self._is_trusted_x_url(await self._page_url(page))
+
+    def _detach_active_page(self, page: Any | None) -> None:
+        if page is not None and self.page is page:
+            self.page = None
+        if page is not None and self._sync_page is page:
+            self._sync_page = None
 
     def _normalize_image_paths(self, image_paths: ImagePathInput | None) -> list[str]:
         if image_paths is None:
@@ -981,56 +1152,61 @@ class _AdapterRuntimeMixin:
         return normalized
 
     async def _is_compose_state(self) -> bool:
-        if not self.page:
+        if not self.page or not await self._page_is_trusted(self.page):
             return False
         url = self.page.url or ""
         return "/compose/" in url
 
-    async def _wait_for_post_submission(self, timeout_seconds: float = 8.0) -> bool:
+    async def _wait_for_post_submission(self, textbox: Any | None = None, timeout_seconds: float = 8.0) -> bool:
         if not self.page:
             return False
+        started_in_compose = await self._is_compose_state()
+        initial_text = ""
+        if textbox is not None:
+            with contextlib.suppress(Exception):
+                initial_text = (await self._inner_text(textbox, timeout_ms=700)).strip()
         deadline = time.monotonic() + max(1.5, timeout_seconds)
         while time.monotonic() < deadline:
-            if not await self._is_compose_state():
+            if started_in_compose and not await self._is_compose_state():
                 return True
-            post_btn = await self._find_first(ui.POST_BUTTONS)
-            if post_btn:
-                disabled = (await self._get_attribute(post_btn, "aria-disabled") or "").strip().lower()
-                if disabled == "true":
+            if textbox is not None:
+                if not await self._count_locator(textbox) or not await self._is_visible(textbox):
                     return True
+                if initial_text:
+                    with contextlib.suppress(Exception):
+                        if not (await self._inner_text(textbox, timeout_ms=500)).strip():
+                            return True
             await asyncio.sleep(0.30)
         return False
 
-    async def _submit_post(self) -> bool:
+    async def _submit_post(self, textbox: Any | None = None) -> bool:
+        """Deliver at most one submit trigger and wait for an observable transition.
+
+        A timeout is intentionally not retried: the first trigger may have reached X,
+        and replaying it could create duplicate content.
+        """
         if not self.page:
             return False
-        for attempt in range(1, 6):
-            post_btn = await self._find_first(ui.POST_BUTTONS, timeout_ms=900)
-            if post_btn:
-                disabled = (await self._get_attribute(post_btn, "aria-disabled") or "").strip().lower()
-                if disabled not in {"true", "1"}:
-                    try:
-                        await self._click(post_btn)
-                        await self.human.jitter(280, 760)
-                        if await self._wait_for_post_submission(4.5):
-                            return True
-                    except Exception as exc:
-                        logger.warning("submit_post_button_click_failed attempt=%s error=%s", attempt, str(exc)[:260])
+        post_btn = await self._find_first(ui.POST_BUTTONS, timeout_ms=900)
+        if post_btn:
+            disabled = (await self._get_attribute(post_btn, "aria-disabled") or "").strip().lower()
+            if disabled in {"true", "1"}:
+                logger.warning("submit_post_button_disabled")
+                return False
             try:
-                await self._keyboard_press("Control+Enter")
-                await self.human.jitter(280, 760)
-                if await self._wait_for_post_submission(4.5):
-                    return True
+                await self._click(post_btn)
             except Exception as exc:
-                logger.warning("submit_post_shortcut_failed attempt=%s key=Control+Enter error=%s", attempt, str(exc)[:260])
+                logger.warning("submit_post_button_click_failed error=%s", str(exc)[:260])
+                return False
+        else:
+            shortcut = "Meta+Enter" if sys.platform == "darwin" else "Control+Enter"
             try:
-                await self._keyboard_press("Meta+Enter")
-                await self.human.jitter(220, 560)
-                if await self._wait_for_post_submission(3.5):
-                    return True
+                await self._keyboard_press(shortcut)
             except Exception as exc:
-                logger.warning("submit_post_shortcut_failed attempt=%s key=Meta+Enter error=%s", attempt, str(exc)[:260])
-        return False
+                logger.warning("submit_post_shortcut_failed key=%s error=%s", shortcut, str(exc)[:260])
+                return False
+        await self.human.jitter(280, 760)
+        return await self._wait_for_post_submission(textbox, 4.5)
 
     async def _is_visible(self, locator: Any) -> bool:
         try:
@@ -1078,41 +1254,6 @@ class _AdapterRuntimeMixin:
                 continue
         return None
 
-    async def _click_reply_audience_done_dom(self) -> bool:
-        if not self.page:
-            return False
-        script = """
-(() => {
-  const dialogs = Array.from(document.querySelectorAll('[role="dialog"]'));
-  const modal = dialogs.find(d => {
-    const close = d.querySelector('[data-testid="app-bar-close"]');
-    if (!close) return false;
-    const txt = (d.innerText || d.textContent || '').toLowerCase();
-    return txt.includes('replying to') && txt.includes('done');
-  });
-  if (!modal) return false;
-  const candidates = Array.from(modal.querySelectorAll('button,[role="button"]'));
-  for (const node of candidates) {
-    const txt = (node.innerText || node.textContent || '').trim().toLowerCase();
-    if (txt !== 'done') continue;
-    const rect = node.getBoundingClientRect();
-    const style = window.getComputedStyle(node);
-    if (!rect || rect.width < 3 || rect.height < 3) continue;
-    if (style.display === 'none' || style.visibility === 'hidden' || style.pointerEvents === 'none') continue;
-    node.scrollIntoView({ block: 'center', inline: 'center', behavior: 'instant' });
-    node.click();
-    return true;
-  }
-  return false;
-})()
-"""
-        try:
-            if self._sync_mode:
-                return bool(await self._run_sync(self._sync_page.evaluate, script))
-            return bool(await self.page.evaluate(script))
-        except Exception:
-            return False
-
     async def _confirm_reply_audience_if_needed(self) -> bool:
         if not self.page:
             return False
@@ -1132,41 +1273,30 @@ class _AdapterRuntimeMixin:
             logger.warning("reply_audience_modal_detected_but_scope_missing")
             return False
 
-        for attempt in range(1, 5):
-            done_btn = await self._find_reply_audience_done_button(active_modal)
-            if done_btn:
-                clicked = False
-                try:
-                    await self._click(done_btn)
-                    clicked = True
-                except Exception:
-                    with contextlib.suppress(Exception):
-                        await self._click_force(done_btn)
-                        clicked = True
-                if clicked:
-                    logger.info("reply_audience_done_click attempt=%s", attempt)
-            else:
-                logger.warning("reply_audience_done_button_not_found attempt=%s", attempt)
+        done_btn = await self._find_reply_audience_done_button(active_modal)
+        if done_btn is None:
+            logger.warning("reply_audience_done_button_not_found")
+            return False
+        try:
+            await self._click(done_btn)
+        except Exception as exc:
+            logger.warning("reply_audience_done_click_failed error=%s", str(exc)[:260])
+            return False
 
-            if await self._has_reply_audience_modal():
-                dom_clicked = await self._click_reply_audience_done_dom()
-                if dom_clicked:
-                    logger.info("reply_audience_done_dom_click attempt=%s", attempt)
-
-            await self.human.jitter(220, 680)
-            await self._wait_network_idle(800)
-            for _ in range(10):
-                if not await self._has_reply_audience_modal():
-                    logger.info("reply_audience_modal_closed")
-                    return True
-                await asyncio.sleep(0.10)
-            logger.info("reply_audience_done_retry attempt=%s", attempt)
+        logger.info("reply_audience_done_click")
+        await self.human.jitter(220, 680)
+        await self._wait_network_idle(800)
+        for _ in range(10):
+            if not await self._has_reply_audience_modal():
+                logger.info("reply_audience_modal_closed")
+                return True
+            await asyncio.sleep(0.10)
 
         logger.warning("reply_audience_modal_still_open_after_done")
         return False
 
     async def _return_home(self, force_nav: bool = False) -> bool:
-        if not self.page:
+        if not self.page or not await self._page_is_trusted(self.page):
             return False
         if await self._looks_like_home_timeline():
             return True
@@ -1192,10 +1322,16 @@ class _AdapterRuntimeMixin:
     async def _reload_current_page(self) -> None:
         if not self.page:
             return
+        if not await self._page_is_trusted(self.page):
+            raise RuntimeError("unsafe_navigation_page")
+        page = self.page
         if self._sync_mode:
-            await self._run_sync(self._sync_page.reload, wait_until="domcontentloaded")
+            await self._run_sync(page.reload, wait_until="domcontentloaded")
         else:
-            await self.page.reload(wait_until="domcontentloaded")
+            await page.reload(wait_until="domcontentloaded")
+        if not await self._page_is_trusted(page):
+            self._detach_active_page(page)
+            raise RuntimeError("navigation_left_trusted_x_origin")
         await self.human.jitter(260, 780)
         await self._wait_network_idle(1300)
 
@@ -1243,13 +1379,30 @@ class _AdapterRuntimeMixin:
         while True:
             for selector in selectors:
                 locator = self.page.locator(selector)
-                if await self._count_locator(locator):
-                    return locator.first
+                count = await self._count_locator(locator)
+                for idx in range(count):
+                    candidate = locator.nth(idx)
+                    if await self._is_visible(candidate):
+                        return candidate
             if timeout_ms <= 0 or time.monotonic() >= deadline:
                 return None
             await asyncio.sleep(0.16)
 
     async def _is_button_enabled(self, locator: Any) -> bool:
+        checker = getattr(locator, "is_enabled", None)
+        if callable(checker):
+            try:
+                if self._sync_mode:
+                    enabled = bool(await self._run_sync(checker))
+                else:
+                    result = checker()
+                    if inspect.isawaitable(result):
+                        result = await result
+                    enabled = bool(result)
+                if not enabled:
+                    return False
+            except Exception:
+                return False
         aria_disabled = (await self._get_attribute(locator, "aria-disabled") or "").strip().lower()
         disabled_attr = (await self._get_attribute(locator, "disabled") or "").strip().lower()
         return aria_disabled not in {"true", "1"} and disabled_attr not in {"true", "1", "disabled"}
@@ -1264,7 +1417,7 @@ class _AdapterRuntimeMixin:
                 count = await self._count_locator(locator)
                 for i in range(count):
                     candidate = locator.nth(i)
-                    if await self._is_button_enabled(candidate):
+                    if await self._is_visible(candidate) and await self._is_button_enabled(candidate):
                         return candidate
             if timeout_ms <= 0 or time.monotonic() >= deadline:
                 return None
@@ -1284,9 +1437,164 @@ class _AdapterRuntimeMixin:
                 count = await self._count_locator(locator)
                 for idx in range(count):
                     candidate = locator.nth(idx)
+                    if not await self._is_visible(candidate):
+                        continue
                     if require_enabled and not await self._is_button_enabled(candidate):
                         continue
                     return candidate
+            if timeout_ms <= 0 or time.monotonic() >= deadline:
+                return None
+            await asyncio.sleep(0.14)
+
+    async def _bind_locator(self, locator: Any, purpose: str) -> tuple[Any | None, str]:
+        """Return a stable locator for one DOM node, or fail if it detached.
+
+        Playwright's ``nth()`` locators are live queries: an insertion ahead of the
+        selected node can silently retarget a later click. A private, per-adapter
+        attribute turns the selected node into an identity-keyed locator. The
+        binding is re-counted and rechecked before it is returned, so a node that
+        detached during selection fails closed.
+        """
+        if not self.page or locator is None or not await self._page_is_trusted(self.page):
+            return None, ""
+        self._locator_binding_counter += 1
+        safe_purpose = re.sub(r"[^a-z0-9_-]+", "-", str(purpose or "node").casefold()).strip("-") or "node"
+        proposed = f"{self._locator_binding_prefix}-{safe_purpose}-{self._locator_binding_counter:x}"
+        script = """
+            (node, payload) => {
+                const attr = payload.attribute;
+                const prefix = payload.prefix;
+                const existing = node.getAttribute(attr) || '';
+                if (existing.startsWith(prefix + '-')) return existing;
+                node.setAttribute(attr, payload.token);
+                return payload.token;
+            }
+        """
+        try:
+            payload = {
+                "attribute": "data-xcontroller-binding",
+                "prefix": self._locator_binding_prefix,
+                "token": proposed,
+            }
+            if self._sync_mode:
+                token = str(await self._run_sync(locator.evaluate, script, payload) or "")
+            else:
+                token = str(await locator.evaluate(script, payload) or "")
+            if not token.startswith(f"{self._locator_binding_prefix}-"):
+                return None, ""
+            stable = self.page.locator(f'[data-xcontroller-binding="{token}"]').first
+            if await self._count_locator(stable) != 1 or not await self._is_visible(stable):
+                return None, ""
+            return stable, token
+        except Exception:
+            return None, ""
+
+    async def _snapshot_visible_bindings(self, selectors: list[str]) -> set[str]:
+        """Bind and return identities for surfaces that are visible right now."""
+        if not self.page or not await self._page_is_trusted(self.page):
+            return set()
+        tokens: set[str] = set()
+        for selector in selectors:
+            locator = self.page.locator(selector)
+            for idx in range(await self._count_locator(locator)):
+                candidate = locator.nth(idx)
+                if not await self._is_visible(candidate):
+                    continue
+                _, token = await self._bind_locator(candidate, "baseline")
+                if token:
+                    tokens.add(token)
+        return tokens
+
+    async def _visible_scope_count(self, selector: str) -> int:
+        """Count visible matches without touching a non-X page."""
+        if not self.page or not await self._page_is_trusted(self.page):
+            return 0
+        locator = self.page.locator(selector)
+        visible = 0
+        for index in range(await self._count_locator(locator)):
+            if await self._is_visible(locator.nth(index)):
+                visible += 1
+        return visible
+
+    async def _find_new_bound_locator(
+        self,
+        scope: Any,
+        selectors: list[str],
+        baseline_tokens: set[str],
+        *,
+        timeout_ms: int,
+        purpose: str,
+        require_enabled: bool = False,
+    ) -> Any | None:
+        """Find a newly visible node and return its stable identity locator."""
+        if not self.page or scope is None or not await self._page_is_trusted(self.page):
+            return None
+        deadline = time.monotonic() + (max(0, timeout_ms) / 1000.0)
+        while True:
+            for selector in selectors:
+                locator = scope.locator(selector)
+                for idx in range(await self._count_locator(locator)):
+                    candidate = locator.nth(idx)
+                    if not await self._is_visible(candidate):
+                        continue
+                    if require_enabled and not await self._is_button_enabled(candidate):
+                        continue
+                    stable, token = await self._bind_locator(candidate, purpose)
+                    if stable is not None and token and token not in baseline_tokens:
+                        return stable
+            if timeout_ms <= 0 or time.monotonic() >= deadline:
+                return None
+            await asyncio.sleep(0.14)
+
+    async def _composer_dialog_matches_target(
+        self,
+        textbox: Any,
+        post_id: str,
+        baseline_dialog_tokens: set[str],
+    ) -> bool:
+        """Verify that a new composer dialog visibly references the target post."""
+        normalized = self._normalize_post_id(post_id)
+        if textbox is None or not normalized:
+            return False
+        try:
+            dialog = textbox.locator("xpath=ancestor::*[@role='dialog'][1]").first
+            if not await self._count_locator(dialog) or not await self._is_visible(dialog):
+                return False
+            stable_dialog, token = await self._bind_locator(dialog, "composer-dialog")
+            if stable_dialog is None or not token or token in baseline_dialog_tokens:
+                return False
+            target_link = await self._find_exact_status_link(stable_dialog, normalized)
+            return target_link is not None and await self._is_visible(target_link)
+        except Exception:
+            return False
+
+    async def _find_new_target_composer(
+        self,
+        post_id: str,
+        baseline_textbox_tokens: set[str],
+        baseline_dialog_tokens: set[str],
+        *,
+        timeout_ms: int,
+    ) -> Any | None:
+        """Return only a new composer whose dialog references ``post_id``."""
+        if not self.page or not await self._page_is_trusted(self.page):
+            return None
+        deadline = time.monotonic() + (max(0, timeout_ms) / 1000.0)
+        rejected_tokens: set[str] = set()
+        while True:
+            box = await self._find_new_bound_locator(
+                self.page,
+                ui.COMPOSE_TEXTBOXES,
+                baseline_textbox_tokens | rejected_tokens,
+                timeout_ms=0,
+                purpose="target-composer",
+            )
+            if box is not None:
+                token = (await self._get_attribute(box, "data-xcontroller-binding")) or ""
+                if await self._composer_dialog_matches_target(box, post_id, baseline_dialog_tokens):
+                    return box
+                if token:
+                    rejected_tokens.add(token)
             if timeout_ms <= 0 or time.monotonic() >= deadline:
                 return None
             await asyncio.sleep(0.14)
@@ -1304,7 +1612,8 @@ class _AdapterRuntimeMixin:
                 parent = textbox.locator("xpath=ancestor::*[self::form or self::article][1]").first
                 if await self._count_locator(parent) and await self._is_visible(parent):
                     scopes.append(parent)
-        scopes.append(self.page)
+        if textbox is None:
+            scopes.append(self.page)
 
         for scope in scopes:
             btn = await self._find_first_in_scope(
@@ -1321,7 +1630,9 @@ class _AdapterRuntimeMixin:
                 logger.info("reply_submit_candidate testid=%s label=%s", testid or "-", label or "-")
             return btn
 
-        return await self._find_first_enabled(ui.REPLY_SEND_BUTTONS, timeout_ms=timeout_ms)
+        if textbox is None:
+            return await self._find_first_enabled(ui.REPLY_SEND_BUTTONS, timeout_ms=timeout_ms)
+        return None
 
     async def _like_in_current_context(self, platform_post_id: str) -> bool:
         if not self.page:
@@ -1329,42 +1640,28 @@ class _AdapterRuntimeMixin:
         post_id = self._normalize_post_id(platform_post_id)
         if not post_id:
             return False
-        current_url = self.page.url or ""
-
-        # Status page path: click the visible post like control without extra navigation.
-        if f"/status/{post_id}" in current_url:
-            article = self.page.locator(f'article:has(a[href*="/status/{post_id}"])').first
-            if not await self._count_locator(article):
-                article = self.page.locator("article").first
-            active_btn = await self._find_first_in_scope(article, ui.LIKE_ACTIVE_BUTTONS, timeout_ms=700)
-            if active_btn:
-                return True
-            like_btn = await self._find_first_in_scope(article, ui.LIKE_BUTTONS, timeout_ms=1200, require_enabled=True)
-            if not like_btn:
-                return False
-            await self._click(like_btn)
-            await self.human.jitter(350, 900)
+        article = await self._find_exact_article(post_id)
+        if article is None:
+            return False
+        active_btn = await self._find_first_in_scope(article, ui.LIKE_ACTIVE_BUTTONS, timeout_ms=700)
+        if active_btn:
             return True
-
-        # Feed/search/profile path: locate target article and click inline like.
-        scan_rounds = 1
-        for round_idx in range(scan_rounds):
-            article = self.page.locator(f'article:has(a[href*="/status/{post_id}"])').first
-            if await self._count_locator(article):
-                active_btn = await self._find_first_in_scope(article, ui.LIKE_ACTIVE_BUTTONS, timeout_ms=450)
-                if active_btn:
-                    return True
-                like_btn = await self._find_first_in_scope(
-                    article,
-                    ui.LIKE_BUTTONS,
-                    timeout_ms=900,
-                    require_enabled=True,
-                )
-                if like_btn:
-                    await self._click(like_btn)
-                    await self.human.jitter(350, 900)
-                    return True
-        return False
+        like_btn = await self._find_first_in_scope(
+            article,
+            ui.LIKE_BUTTONS,
+            timeout_ms=1200,
+            require_enabled=True,
+        )
+        if not like_btn:
+            return False
+        if await self._article_primary_post_id(article) != post_id:
+            return False
+        await self._click(like_btn)
+        await self.human.jitter(350, 900)
+        refreshed = await self._find_exact_article(post_id)
+        if refreshed is None:
+            return False
+        return await self._find_first_in_scope(refreshed, ui.LIKE_ACTIVE_BUTTONS, timeout_ms=900) is not None
 
     async def _find_post_article_in_context(self, platform_post_id: str, scan_rounds: int = 1) -> Any | None:
         if not self.page:
@@ -1373,18 +1670,10 @@ class _AdapterRuntimeMixin:
         if not post_id:
             return None
 
-        current_url = self.page.url or ""
-        if f"/status/{post_id}" in current_url:
-            article = self.page.locator(f'article:has(a[href*="/status/{post_id}"])').first
-            if not await self._count_locator(article):
-                article = self.page.locator("article").first
-            if await self._count_locator(article):
-                return article
-
         rounds = max(1, int(scan_rounds))
         for idx in range(rounds):
-            article = self.page.locator(f'article:has(a[href*="/status/{post_id}"])').first
-            if await self._count_locator(article):
+            article = await self._find_exact_article(post_id)
+            if article is not None:
                 return article
             if idx < rounds - 1:
                 await self._random_scroll(random.randint(240, 760))
@@ -1406,8 +1695,13 @@ class _AdapterRuntimeMixin:
             await self.human.jitter(140, 380)
 
     async def _open_reply_box_in_current_context(self, platform_post_id: str, scan_rounds: int = 2) -> Any | None:
-        if not self.page:
+        if not self.page or not await self._page_is_trusted(self.page):
             return None
+        post_id = self._normalize_post_id(platform_post_id)
+        if not post_id:
+            return None
+        baseline_boxes = await self._snapshot_visible_bindings(ui.COMPOSE_TEXTBOXES)
+        baseline_dialogs = await self._snapshot_visible_bindings(['[role="dialog"]'])
         article = await self._find_post_article_in_context(platform_post_id, scan_rounds=max(1, scan_rounds))
         reply_btn = None
         if article:
@@ -1418,26 +1712,40 @@ class _AdapterRuntimeMixin:
                 require_enabled=True,
             )
         if not reply_btn:
-            post_id = self._normalize_post_id(platform_post_id)
-            if post_id and f"/status/{post_id}" in (self.page.url or ""):
-                reply_btn = await self._find_first_enabled(ui.COMMENT_BUTTONS, timeout_ms=900)
-        if not reply_btn:
             return None
 
+        if await self._article_primary_post_id(article) != post_id:
+            return None
         await self._click(reply_btn)
         await self.human.jitter(280, 900)
-        box = await self._find_first(ui.COMPOSE_TEXTBOXES, timeout_ms=2600)
+        box = await self._find_new_target_composer(
+            post_id,
+            baseline_boxes,
+            baseline_dialogs,
+            timeout_ms=2600,
+        )
         if box:
             return box
         if await self._confirm_reply_audience_if_needed():
-            box = await self._find_first(ui.COMPOSE_TEXTBOXES, timeout_ms=1400)
+            box = await self._find_new_target_composer(
+                post_id,
+                baseline_boxes,
+                baseline_dialogs,
+                timeout_ms=1400,
+            )
             if box:
                 return box
         return None
 
     async def _open_quote_box_in_current_context(self, platform_post_id: str, scan_rounds: int = 2) -> Any | None:
-        if not self.page:
+        if not self.page or not await self._page_is_trusted(self.page):
             return None
+        post_id = self._normalize_post_id(platform_post_id)
+        if not post_id:
+            return None
+        baseline_boxes = await self._snapshot_visible_bindings(ui.COMPOSE_TEXTBOXES)
+        baseline_dialogs = await self._snapshot_visible_bindings(['[role="dialog"]'])
+        baseline_menus = await self._snapshot_visible_bindings(['[role="menu"]'])
         article = await self._find_post_article_in_context(platform_post_id, scan_rounds=max(1, scan_rounds))
         repost_btn = None
         if article:
@@ -1447,17 +1755,30 @@ class _AdapterRuntimeMixin:
                 timeout_ms=1400,
                 require_enabled=True,
             )
-        post_id = self._normalize_post_id(platform_post_id)
-        if not repost_btn and post_id and f"/status/{post_id}" in (self.page.url or ""):
-            repost_btn = await self._find_first_enabled(ui.REPOST_BUTTONS, timeout_ms=1200)
         if not repost_btn:
             return None
 
+        if await self._article_primary_post_id(article) != post_id:
+            return None
         await self._click(repost_btn)
         await self.human.jitter(220, 700)
-        quote_item = await self._find_first_enabled(ui.QUOTE_MENU_ITEMS, timeout_ms=2600)
-        if not quote_item:
-            quote_item = await self._find_first(ui.QUOTE_MENU_ITEMS, timeout_ms=800)
+        menu = await self._find_new_bound_locator(
+            self.page,
+            ['[role="menu"]'],
+            baseline_menus,
+            timeout_ms=2600,
+            purpose="quote-menu",
+        )
+        quote_item = (
+            await self._find_first_in_scope(
+                menu,
+                ui.QUOTE_MENU_ITEMS,
+                timeout_ms=600,
+                require_enabled=True,
+            )
+            if menu is not None
+            else None
+        )
         if not quote_item:
             logger.warning("quote_menu_item_not_found target=%s", post_id or platform_post_id)
             with contextlib.suppress(Exception):
@@ -1466,7 +1787,12 @@ class _AdapterRuntimeMixin:
             return None
         await self._click(quote_item)
         await self.human.jitter(350, 1000)
-        box = await self._find_first(ui.COMPOSE_TEXTBOXES, timeout_ms=3200)
+        box = await self._find_new_target_composer(
+            post_id,
+            baseline_boxes,
+            baseline_dialogs,
+            timeout_ms=3200,
+        )
         if box:
             return box
         with contextlib.suppress(Exception):
@@ -1475,7 +1801,7 @@ class _AdapterRuntimeMixin:
         return None
 
     async def _looks_like_home_timeline(self) -> bool:
-        if not self.page:
+        if not self.page or not await self._page_is_trusted(self.page):
             return False
         if await self._any_selector(ui.HOME_SELECTORS):
             return True
@@ -1491,7 +1817,7 @@ class _AdapterRuntimeMixin:
         return "home" in aria_labelledby and "timeline" in aria_labelledby
 
     async def _looks_like_notifications_page(self) -> bool:
-        if not self.page:
+        if not self.page or not await self._page_is_trusted(self.page):
             return False
         url = (self.page.url or "").lower()
         if "/notifications" in url:
@@ -1499,7 +1825,7 @@ class _AdapterRuntimeMixin:
         return await self._any_selector(ui.NOTIFICATIONS_ACTIVE_SELECTORS)
 
     async def _open_home_via_click(self) -> bool:
-        if not self.page:
+        if not self.page or not await self._page_is_trusted(self.page):
             return False
         if await self._looks_like_home_timeline():
             return True
@@ -1517,6 +1843,8 @@ class _AdapterRuntimeMixin:
         return False
 
     async def _select_home_tab(self, tab: str) -> bool:
+        if not self.page or not await self._page_is_trusted(self.page):
+            return False
         target = str(tab or "for_you").strip().lower()
         if target in {"for-you", "for you", "foryou"}:
             target = "for_you"
@@ -1548,7 +1876,7 @@ class _AdapterRuntimeMixin:
         return await self._select_home_tab(tab)
 
     async def _open_notifications_via_click(self) -> bool:
-        if not self.page:
+        if not self.page or not await self._page_is_trusted(self.page):
             return False
         if await self._looks_like_notifications_page():
             return True
@@ -1565,7 +1893,7 @@ class _AdapterRuntimeMixin:
         return False
 
     async def _open_notifications_mentions_tab(self) -> bool:
-        if not self.page:
+        if not self.page or not await self._page_is_trusted(self.page):
             return False
         for _ in range(3):
             tab = await self._find_first(ui.NOTIFICATIONS_MENTIONS_TAB_SELECTORS, timeout_ms=1200)
@@ -1633,7 +1961,7 @@ class _AdapterRuntimeMixin:
             return False
 
     async def _set_search_mode(self, mode: str) -> bool:
-        if not self.page:
+        if not self.page or not await self._page_is_trusted(self.page):
             return False
         self._clear_action_error()
         target_mode = (mode or "").strip().lower()
@@ -1655,36 +1983,26 @@ class _AdapterRuntimeMixin:
     async def _open_profile_page(self, username: str) -> bool:
         if not self.page:
             return False
-        handle = self._normalize_username(username)
+        handle = self._normalize_account_handle(username)
         if not handle:
             return False
-        # Try click-based discovery from current feed/search first.
-        direct = self.page.locator(f'a[href^="/{handle}"]').first
-        if await self._count_locator(direct):
-            with contextlib.suppress(Exception):
-                await self._click(direct)
-                await self.human.jitter(260, 780)
-                await self._wait_network_idle(1200)
-                return True
-
-        # Fallback: open via search UI and click profile result.
-        searched = await self._open_search_query(f"@{handle}")
-        if searched:
-            profile_link = self.page.locator(f'a[href^="/{handle}"]').first
-            if await self._count_locator(profile_link):
-                with contextlib.suppress(Exception):
-                    await self._click(profile_link)
-                    await self.human.jitter(280, 860)
-                    await self._wait_network_idle(1400)
-                    return True
-        return False
+        try:
+            await self._goto(f"{self.BASE_URL}/{handle}")
+        except Exception as exc:
+            logger.warning("open_profile_failed handle=%s error=%s", handle, str(exc)[:260])
+            return False
+        current_handle = self._profile_handle_from_url(self.page.url or "")
+        return current_handle.lower() == handle.lower()
 
     def _extract_profile_handle_from_href(self, href: str) -> str:
         raw = str(href or "").strip()
         if not raw:
             return ""
         if raw.startswith("http"):
-            match = self.PROFILE_URL_RE.search(raw)
+            trusted = self._normalize_trusted_x_url(raw)
+            if not trusted:
+                return ""
+            match = self.PROFILE_URL_RE.search(trusted)
             if match:
                 return self._normalize_username(match.group(1))
         path = raw.split("?", 1)[0].split("#", 1)[0].strip("/")
@@ -1704,7 +2022,12 @@ class _AdapterRuntimeMixin:
         if not self.page:
             return None
         for attempt in range(2):
-            for selector in ui.PROFILE_ENTRY_SELECTORS:
+            # Only authenticated side-navigation controls are identity evidence.
+            # Generic profile aria-label links can belong to any visible author.
+            for selector in (
+                'a[data-testid="AppTabBar_Profile_Link"]',
+                '[data-testid="SideNav_AccountSwitcher_Button"]',
+            ):
                 locator = self.page.locator(selector).first
                 if not await self._count_locator(locator):
                     continue
@@ -1783,7 +2106,11 @@ class _AdapterRuntimeMixin:
                 media.append(ObservedMediaData(kind="video", url=src, thumbnail_url=poster).to_dict())
         return media
 
-    async def _screenshot_locator(self, locator: Any, path: Path) -> bool:
+    async def _screenshot_locator(self, locator: Any, path: Path, *, overwrite: bool = False) -> bool:
+        if path.is_symlink():
+            raise ValueError(f"media_capture_symlink_target:{path.name}")
+        if path.exists() and not overwrite:
+            raise FileExistsError(f"media_capture_target_exists:{path.name}")
         try:
             if self._sync_mode:
                 await self._run_sync(locator.screenshot, path=str(path))
@@ -1793,6 +2120,32 @@ class _AdapterRuntimeMixin:
         except Exception as exc:
             logger.warning("media_capture_screenshot_failed path=%s error=%s", path, str(exc)[:220])
             return False
+
+    async def _media_node_belongs_to_post(self, locator: Any, target_post_id: str) -> bool:
+        script = """node => {
+            const link = node.closest('a[href*="/status/"]');
+            if (link) return link.getAttribute('href') || '';
+            const article = node.closest('article');
+            if (!article) return '';
+            let parent = node.parentElement;
+            while (parent && parent !== article) {
+                if (parent.matches('[data-testid="quoteTweet"], [data-testid="card.wrapper"]')) return '';
+                const candidate = parent.querySelector(':scope > a[href*="/status/"]');
+                if (candidate) return candidate.getAttribute('href') || '';
+                parent = parent.parentElement;
+            }
+            const timestamp = article.querySelector('time');
+            const timestampLink = timestamp && timestamp.closest('a[href*="/status/"]');
+            return timestampLink ? (timestampLink.getAttribute('href') || '') : '';
+        }"""
+        try:
+            if self._sync_mode:
+                href = await self._run_sync(locator.evaluate, script)
+            else:
+                href = await locator.evaluate(script)
+        except Exception:
+            return False
+        return self._normalize_post_id(self._normalize_trusted_x_url(href)) == target_post_id
 
     async def _play_video_locator(self, locator: Any) -> None:
         script = """node => {
@@ -1814,23 +2167,27 @@ class _AdapterRuntimeMixin:
         target_post_id: str,
         output_dir: Path,
         frame_count: int = 3,
+        *,
+        overwrite: bool = False,
     ) -> list[MediaCaptureData]:
         if not article:
             return []
         captures: list[MediaCaptureData] = []
         seen_sources: set[str] = set()
 
-        with contextlib.suppress(Exception):
-            images = article.locator("img")
+        try:
+            images = article.locator('[data-testid="tweetPhoto"] img')
             for idx in range(min(await self._count_locator(images), 24)):
                 image = images.nth(idx)
                 src = (await self._get_attribute(image, "src")) or ""
                 alt = (await self._get_attribute(image, "alt")) or ""
                 if not src or "profile_images" in src or src in seen_sources:
                     continue
+                if not await self._media_node_belongs_to_post(image, target_post_id):
+                    continue
                 seen_sources.add(src)
                 path = output_dir / f"{target_post_id}_image_{idx + 1}.png"
-                ok = await self._screenshot_locator(image, path)
+                ok = await self._screenshot_locator(image, path, overwrite=overwrite)
                 captures.append(
                     MediaCaptureData(
                         kind="image",
@@ -1842,18 +2199,24 @@ class _AdapterRuntimeMixin:
                         raw={"selector": "img", "index": idx, "screenshot_ok": ok},
                     )
                 )
+        except (FileExistsError, ValueError):
+            raise
+        except Exception:
+            pass
 
         max_frames = max(1, min(int(frame_count), 10))
-        with contextlib.suppress(Exception):
+        try:
             videos = article.locator("video")
             for video_idx in range(min(await self._count_locator(videos), 6)):
                 video = videos.nth(video_idx)
                 src = (await self._get_attribute(video, "src")) or ""
                 poster = (await self._get_attribute(video, "poster")) or ""
+                if not await self._media_node_belongs_to_post(video, target_post_id):
+                    continue
                 await self._play_video_locator(video)
                 for frame_idx in range(max_frames):
                     path = output_dir / f"{target_post_id}_video_{video_idx + 1}_frame_{frame_idx + 1}.png"
-                    ok = await self._screenshot_locator(video, path)
+                    ok = await self._screenshot_locator(video, path, overwrite=overwrite)
                     captures.append(
                         MediaCaptureData(
                             kind="video",
@@ -1871,11 +2234,22 @@ class _AdapterRuntimeMixin:
                     )
                     if frame_idx < max_frames - 1:
                         await asyncio.sleep(0.35)
+        except (FileExistsError, ValueError):
+            raise
+        except Exception:
+            pass
         return captures
 
     async def _extract_article_status_url(self, article: Any) -> str:
         urls = await self._extract_article_status_urls(article)
-        return urls[0] if urls else ""
+        if not urls:
+            return ""
+        primary_id = await self._article_primary_post_id(article)
+        if primary_id:
+            for url in urls:
+                if self._normalize_post_id(url) == primary_id:
+                    return url
+        return urls[0]
 
     async def _extract_article_status_urls(self, article: Any) -> list[str]:
         if not article:
@@ -1887,20 +2261,72 @@ class _AdapterRuntimeMixin:
         urls: list[str] = []
         for idx in range(min(total, 20)):
             href = (await self._get_attribute(links.nth(idx), "href")) or ""
-            if href.startswith("http"):
-                url = href
-            elif href.startswith("/"):
-                url = f"{self.BASE_URL}{href}"
-            else:
-                url = href
+            url = self._normalize_trusted_x_url(href)
             if url and url not in urls:
                 urls.append(url)
         return urls
 
+    async def _article_primary_post_id(self, article: Any) -> str:
+        """Return the outer article's canonical post ID, never a nested quote ID."""
+        if not article:
+            return ""
+        with contextlib.suppress(Exception):
+            times = article.locator("time")
+            if await self._count_locator(times):
+                timestamp_link = times.first.locator("xpath=ancestor::a[contains(@href, '/status/')][1]")
+                if await self._count_locator(timestamp_link):
+                    href = (await self._get_attribute(timestamp_link.first, "href")) or ""
+                    post_id = self._normalize_post_id(
+                        self._normalize_trusted_x_url(href)
+                    )
+                    if post_id:
+                        return post_id
+        urls = await self._extract_article_status_urls(article)
+        return self._normalize_post_id(urls[0]) if urls else ""
+
+    async def _find_exact_article(self, post_id: str, *, max_articles: int = 80) -> Any | None:
+        if not self.page or not await self._page_is_trusted(self.page):
+            return None
+        normalized = self._normalize_post_id(post_id)
+        if not normalized:
+            return None
+        articles = self.page.locator("article")
+        total = await self._count_locator(articles)
+        for idx in range(min(total, max(1, int(max_articles)))):
+            candidate = articles.nth(idx)
+            if not await self._is_visible(candidate):
+                continue
+            if await self._article_primary_post_id(candidate) == normalized:
+                stable, _ = await self._bind_locator(candidate, f"article-{normalized}")
+                if stable is None:
+                    continue
+                # Binding can race a virtualized timeline update. Revalidate the
+                # identity-keyed locator and fail if the selected node detached or
+                # changed before returning it to a downstream click workflow.
+                if not await self._is_visible(stable):
+                    return None
+                if await self._article_primary_post_id(stable) != normalized:
+                    return None
+                return stable
+        return None
+
+    async def _find_exact_status_link(self, scope: Any, post_id: str) -> Any | None:
+        normalized = self._normalize_post_id(post_id)
+        if not scope or not normalized:
+            return None
+        links = scope.locator('a[href*="/status/"]')
+        total = await self._count_locator(links)
+        for idx in range(min(total, 100)):
+            candidate = links.nth(idx)
+            href = (await self._get_attribute(candidate, "href")) or ""
+            if self._normalize_post_id(self._normalize_trusted_x_url(href)) == normalized:
+                return candidate
+        return None
+
     def _extract_status_ids_from_urls(self, urls: Sequence[str]) -> list[str]:
         post_ids: list[str] = []
         for url in urls:
-            post_id = self._extract_post_id(str(url or ""))
+            post_id = self._normalize_post_id(str(url or ""))
             if post_id and post_id not in post_ids:
                 post_ids.append(post_id)
         return post_ids
@@ -1970,8 +2396,10 @@ class _AdapterRuntimeMixin:
         return len(self._extract_status_ids_from_urls(urls)) >= 2
 
     async def _classify_profile_article(self, article: Any, own_handle: str) -> dict[str, Any]:
-        url = await self._extract_article_status_url(article)
-        post_id = self._extract_post_id(url)
+        urls = await self._extract_article_status_urls(article)
+        post_id = await self._article_primary_post_id(article)
+        url = next((candidate for candidate in urls if self._normalize_post_id(candidate) == post_id), "")
+        status_ids = self._extract_status_ids_from_urls(urls)
         author = await self._extract_article_author_handle(article)
         text = (await self._extract_article_text(article))[:4000]
         body = ""
@@ -1995,6 +2423,7 @@ class _AdapterRuntimeMixin:
             "author": author,
             "text": text,
             "created_at": created_at.isoformat() if created_at else None,
+            "status_ids": status_ids,
             "social_context": social_context,
             "is_reply": is_reply,
             "is_repost": is_repost,
@@ -2022,7 +2451,9 @@ class _AdapterRuntimeMixin:
         return False
 
     def _profile_surface_url(self, own_handle: str, kind: str) -> str:
-        handle = self._normalize_username(own_handle)
+        handle = self._normalize_account_handle(own_handle)
+        if not handle:
+            return ""
         if kind == "reply":
             return f"{self.BASE_URL}/{handle}/with_replies"
         return f"{self.BASE_URL}/{handle}"
@@ -2031,13 +2462,15 @@ class _AdapterRuntimeMixin:
         if not self.page:
             return False
         target_url = self._profile_surface_url(own_handle, kind)
+        if not target_url:
+            return False
         current = (self.page.url or "").rstrip("/")
         if current == target_url.rstrip("/"):
             return True
         try:
             await self._goto(target_url)
             await self.human.jitter(280, 760)
-            return True
+            return self._profile_handle_from_url(self.page.url or "").lower() == own_handle.lower()
         except Exception as exc:
             logger.warning(
                 "open_profile_surface_failed kind=%s handle=%s error=%s",
@@ -2060,16 +2493,9 @@ class _AdapterRuntimeMixin:
             return None
         rounds = max(2, int(scan_rounds))
         for round_idx in range(rounds):
-            article = self.page.locator(f'article:has(a[href*="/status/{post_id}"])').first
-            if await self._count_locator(article):
+            article = await self._find_exact_article(post_id)
+            if article is not None:
                 return article
-            articles = self.page.locator("article")
-            total = await self._count_locator(articles)
-            for idx in range(min(total, 80)):
-                candidate = articles.nth(idx)
-                href = await self._extract_article_status_url(candidate)
-                if self._extract_post_id(href) == post_id:
-                    return candidate
             if round_idx < rounds - 1:
                 await self._random_scroll(random.randint(380, 1160))
                 await self.human.jitter(220, 620)
@@ -2083,6 +2509,9 @@ class _AdapterRuntimeMixin:
     ) -> tuple[Any, dict[str, Any]] | None:
         if not self.page:
             return None
+        post_id = self._normalize_post_id(post_id)
+        if not post_id:
+            return None
         try:
             await self._goto(f"{self.BASE_URL}/i/web/status/{post_id}")
         except Exception as exc:
@@ -2093,18 +2522,7 @@ class _AdapterRuntimeMixin:
             return None
         item = await self._classify_profile_article(article, own_handle)
         if str(item.get("post_id") or "") != post_id:
-            urls = await self._extract_article_status_urls(article)
-            if post_id not in self._extract_status_ids_from_urls(urls):
-                return None
-            item["post_id"] = post_id
-            item["url"] = f"{self.BASE_URL}/i/web/status/{post_id}"
-        author_matches = str(item.get("author") or "").lower() == own_handle.lower()
-        if author_matches and kind == "reply" and not bool(item.get("is_repost")):
-            # Direct status pages can omit the profile "Replying to" marker. For
-            # exact created-content deletes, trust the caller's ledger kind.
-            item["is_reply"] = True
-        if author_matches and kind == "quote" and not bool(item.get("is_repost")):
-            item["is_quote"] = True
+            return None
         if not self._profile_item_matches_kind(item, kind, own_handle):
             logger.warning(
                 "direct_delete_status_kind_mismatch target=%s kind=%s author=%s is_reply=%s is_repost=%s is_quote=%s",
@@ -2128,8 +2546,8 @@ class _AdapterRuntimeMixin:
         if not self.page:
             return True
         for _ in range(max(4, retries)):
-            article = self.page.locator(f'article:has(a[href*="/status/{post_id}"])').first
-            if not await self._count_locator(article):
+            article = await self._find_exact_article(post_id)
+            if article is None:
                 return True
             await asyncio.sleep(0.25)
         return False
@@ -2256,15 +2674,7 @@ class _AdapterRuntimeMixin:
         return rows
 
     async def _resolve_target_article(self, post_id: str) -> Any | None:
-        article = await self._find_post_article_in_context(post_id, scan_rounds=1)
-        if article:
-            return article
-        if not self.page:
-            return None
-        fallback = self.page.locator("article").first
-        if await self._count_locator(fallback):
-            return fallback
-        return None
+        return await self._find_post_article_in_context(post_id, scan_rounds=1)
 
     async def _wait_for_post_disappearance(self, post_id: str, retries: int = 14) -> bool:
         for _ in range(max(3, retries)):
@@ -2272,7 +2682,7 @@ class _AdapterRuntimeMixin:
                 return True
             current_url = self.page.url or ""
             article = await self._find_post_article_in_context(post_id, scan_rounds=1)
-            if f"/status/{post_id}" not in current_url and article is None:
+            if self._normalize_post_id(current_url) != post_id and article is None:
                 return True
             if article is None:
                 return True
@@ -2283,9 +2693,13 @@ class _AdapterRuntimeMixin:
         """Return structured controller state from `current_state`."""
         if not self.page:
             return {"state": "not_started", "url": ""}
-        url = self.page.url or ""
+        url = await self._page_url(self.page)
+        if await self._page_is_closed(self.page):
+            return {"state": "closed", "url": url}
         state: dict[str, str]
-        if self._looks_like_login_flow_url(url) and await self._any_selector(ui.LOGIN_SELECTORS):
+        if not self._normalize_trusted_x_url(url):
+            state = {"state": "unknown", "url": url}
+        elif self._looks_like_login_flow_url(url) and await self._any_selector(ui.LOGIN_SELECTORS):
             state = {"state": "login", "url": url}
         elif "/compose/" in url:
             state = {"state": "compose", "url": url}
@@ -2306,6 +2720,8 @@ class _AdapterRuntimeMixin:
         return state
 
     def _looks_like_login_flow_url(self, url: str) -> bool:
+        if not self._normalize_trusted_x_url(url):
+            return False
         lowered = str(url or "").lower()
         return any(token in lowered for token in ("/login", "/i/flow/", "/i/jf/onboarding")) or "mode=login" in lowered
 
@@ -2324,6 +2740,17 @@ class _AdapterRuntimeMixin:
         state = await self.current_state()
         page_state = str(state.get("state") or "unknown")
         url = str(state.get("url") or self.page.url or "")
+        trusted_origin = bool(self._is_trusted_x_url(url))
+        if page_state == "closed" or not trusted_origin:
+            return LoginState(
+                logged_in=False,
+                page_state=page_state,
+                url=url,
+                browser_started=page_state != "closed",
+                active_home_tab="",
+                login_required=True,
+                raw={"reason": "closed_page" if page_state == "closed" else "untrusted_origin"},
+            )
         login_markers_visible = await self._any_selector(ui.LOGIN_SELECTORS)
         logged_in_selectors_visible = await self._any_selector(ui.LOGGED_IN_SELECTORS)
         login_link_visible = False
@@ -2332,15 +2759,13 @@ class _AdapterRuntimeMixin:
 
         login_url = self._looks_like_login_flow_url(url)
         known_logged_in_surface = page_state in {"home", "search", "status", "profile", "notifications", "compose"}
-        logged_in = bool(
-            not login_url
-            and not login_markers_visible
-            and (logged_in_selectors_visible or (known_logged_in_surface and not login_link_visible))
-        )
+        logged_in = bool(trusted_origin and not login_url and not login_markers_visible and logged_in_selectors_visible)
         raw: dict[str, Any] = {
             "login_markers_visible": login_markers_visible,
             "logged_in_selectors_visible": logged_in_selectors_visible,
             "login_link_visible": login_link_visible,
+            "trusted_origin": trusted_origin,
+            "known_surface": known_logged_in_surface,
         }
         if self.last_action_error:
             raw["last_action_error"] = self.last_action_error.to_dict()
@@ -2358,9 +2783,13 @@ class _AdapterRuntimeMixin:
         """Provide login-flow behavior through `is_logged_in`."""
         if not self.page:
             return False
-        if not await self._open_home_via_click():
+        if not await self._page_is_trusted(self.page):
+            await self._goto(f"{self.BASE_URL}/home")
+        elif not await self._open_home_via_click():
             await self._goto(f"{self.BASE_URL}/home")
         current_url = self.page.url or ""
+        if not self._normalize_trusted_x_url(current_url):
+            return False
         login_markers_visible = await self._any_selector(ui.LOGIN_SELECTORS)
         if self._looks_like_login_flow_url(current_url):
             return False
@@ -2368,9 +2797,7 @@ class _AdapterRuntimeMixin:
             return False
         if await self._any_selector(ui.LOGGED_IN_SELECTORS):
             return True
-        if await self._looks_like_home_timeline():
-            return not login_markers_visible
-        return not login_markers_visible and not await self._count_locator(self.page.locator('a[href="/login"]'))
+        return False
 
     async def open_login_page(self) -> None:
         """Provide login-flow behavior through `open_login_page`."""
@@ -2385,7 +2812,7 @@ class _AdapterRuntimeMixin:
         stagnation_limit: int,
         allow_backtrack: bool = False,
     ) -> list[ObservedPostData]:
-        if not self.page:
+        if not self.page or not await self._page_is_trusted(self.page):
             return []
         posts: list[ObservedPostData] = []
         seen_ids: set[str] = set()
@@ -2396,11 +2823,8 @@ class _AdapterRuntimeMixin:
             new_posts_in_round = 0
             for idx in range(min(total, max_scan)):
                 item = articles.nth(idx)
-                link = item.locator('a[href*="/status/"]').first
-                if not await self._count_locator(link):
-                    continue
-                href = (await self._get_attribute(link, "href")) or ""
-                post_id = self._extract_post_id(href)
+                href = await self._extract_article_status_url(item)
+                post_id = await self._article_primary_post_id(item)
                 if not post_id or post_id in seen_ids:
                     continue
                 seen_ids.add(post_id)

@@ -58,6 +58,9 @@ class ServiceContractTests(unittest.IsolatedAsyncioTestCase):
 
     def _adapter(self, settings: ControllerSettings | dict | None = None) -> XTextAdapter:
         adapter = XTextAdapter(profile_path=str(self.tmp_path / "profile"), settings=settings)
+        adapter._mutation_guard = AsyncMock(return_value=(True, "", {}))  # type: ignore[method-assign]
+        adapter._mutation_commit_guard = AsyncMock(return_value=(True, "", {}))  # type: ignore[method-assign]
+        adapter._snapshot_recent_owned_ids = AsyncMock(return_value=set())  # type: ignore[method-assign]
         self.addCleanup(adapter._shutdown_executor)
         return adapter
 
@@ -123,7 +126,7 @@ class ServiceContractTests(unittest.IsolatedAsyncioTestCase):
         adapter = self._adapter()
         good = self.tmp_path / "ok.png"
         bad = self.tmp_path / "bad.bmp"
-        good.write_bytes(b"image")
+        good.write_bytes(b"\x89PNG\r\n\x1a\nimage-data")
         bad.write_bytes(b"image")
 
         result = await adapter.attach_images_preflight([good, bad, self.tmp_path / "missing.jpg"])
@@ -146,7 +149,7 @@ class ServiceContractTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(post.ok)
         self.assertEqual(post.action, "post")
 
-    async def test_like_post_detailed_uses_navigation_fallback_after_inline_miss(self) -> None:
+    async def test_like_post_detailed_does_not_replay_after_unconfirmed_attempt(self) -> None:
         class FakePage:
             url = "https://x.com/home"
 
@@ -154,14 +157,17 @@ class ServiceContractTests(unittest.IsolatedAsyncioTestCase):
         adapter.page = FakePage()  # type: ignore[assignment]
         adapter._like_in_current_context = AsyncMock(return_value=False)  # type: ignore[method-assign]
         adapter.engage_post = AsyncMock(return_value={"opened": True, "viewed": False, "liked": True})  # type: ignore[method-assign]
-        adapter.preflight_action = AsyncMock()  # type: ignore[method-assign]
+        adapter.preflight_action = AsyncMock(  # type: ignore[method-assign]
+            return_value=ActionPreflight(ok=True, action="like", target_post_id="123")
+        )
 
         result = await adapter.like_post_detailed("123")
 
-        self.assertTrue(result.ok)
-        self.assertTrue(result.confirmation_observed)
-        adapter.engage_post.assert_awaited_once_with("123", do_view=False, do_like=True)
-        adapter.preflight_action.assert_not_awaited()
+        self.assertFalse(result.ok)
+        self.assertEqual(result.failure_reason, "like_state_not_confirmed")
+        self.assertFalse(result.confirmation_observed)
+        adapter.engage_post.assert_not_awaited()
+        adapter.preflight_action.assert_awaited_once_with("123", action="like")
 
     async def test_follow_user_detailed_includes_soft_error_diagnostic_on_failure(self) -> None:
         class FakePage:
@@ -214,6 +220,9 @@ class ServiceContractTests(unittest.IsolatedAsyncioTestCase):
         adapter._guess_recent_post_id = AsyncMock(return_value=None)  # type: ignore[method-assign]
         adapter._find_first = AsyncMock(return_value=send_after)  # type: ignore[method-assign]
         adapter._is_button_enabled = AsyncMock(return_value=False)  # type: ignore[method-assign]
+        adapter._submit_composer_once = AsyncMock(  # type: ignore[method-assign]
+            return_value=(True, True, "send_button_disabled")
+        )
 
         result = await adapter.reply_to_post_detailed("123", "hello")
 

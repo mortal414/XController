@@ -22,13 +22,25 @@ from .base import (
     ControllerHealth,
     MediaCaptureData,
     MediaPreflight,
-    ObservedMediaData,
     ObservedNotificationData,
     ObservedPostData,
     TimelineReadResult,
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _require_positive_int(value: Any, name: str) -> int:
+    """Normalize a public integer option while rejecting invalid ranges."""
+    if isinstance(value, bool):
+        raise ValueError(f"{name} must be a positive integer")
+    try:
+        normalized = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{name} must be a positive integer") from exc
+    if normalized <= 0:
+        raise ValueError(f"{name} must be a positive integer")
+    return normalized
 
 
 class _AdapterReadMixin:
@@ -299,8 +311,8 @@ class _AdapterReadMixin:
             return None
 
         status_urls = await self._extract_article_status_urls(article)
-        url = status_urls[0] if status_urls else ""
-        post_id = self._extract_post_id(url)
+        url = await self._extract_article_status_url(article)
+        post_id = await self._article_primary_post_id(article)
         status_post_ids = self._extract_status_ids_from_urls(status_urls)
         related_post_ids = [item for item in status_post_ids if item != post_id]
         text = (await self._extract_article_text(article))[:4000]
@@ -496,10 +508,16 @@ class _AdapterReadMixin:
         max_scroll_rounds: int = 36,
     ) -> list[ObservedPostData]:
         """Read data from the active X surface using the `read_mentions` flow."""
-        if not self.page:
-            return []
-        handle = self._normalize_username(account_handle).lower()
+        handle = self._normalize_account_handle(account_handle).lower()
         if not handle:
+            raise ValueError("account_handle must be a valid X handle")
+        requested_hours = _require_positive_int(hours_back, "hours_back")
+        requested_limit = _require_positive_int(limit, "limit")
+        requested_min_rounds = _require_positive_int(min_scroll_rounds, "min_scroll_rounds")
+        requested_max_rounds = _require_positive_int(max_scroll_rounds, "max_scroll_rounds")
+        if requested_max_rounds < requested_min_rounds:
+            raise ValueError("max_scroll_rounds must be greater than or equal to min_scroll_rounds")
+        if not self.page:
             return []
 
         if not await self._looks_like_notifications_page():
@@ -509,12 +527,15 @@ class _AdapterReadMixin:
         if not await self._looks_like_notifications_page():
             return []
 
-        await self._open_notifications_mentions_tab()
+        if not await self._open_notifications_mentions_tab():
+            return []
 
-        max_items = max(5, min(int(limit), 400))
-        min_rounds = max(2, min(int(min_scroll_rounds), 100))
-        max_rounds = max(min_rounds, min(int(max_scroll_rounds), 140))
-        cutoff = datetime.now(timezone.utc) - timedelta(hours=max(1, min(int(hours_back), 72)))
+        max_items = min(requested_limit, 400)
+        min_rounds = min(requested_min_rounds, 100)
+        max_rounds = min(requested_max_rounds, 140)
+        if max_rounds < min_rounds:
+            min_rounds = max_rounds
+        cutoff = datetime.now(timezone.utc) - timedelta(hours=min(requested_hours, 72))
 
         mentions: list[ObservedPostData] = []
         seen_ids: set[str] = set()
@@ -530,11 +551,8 @@ class _AdapterReadMixin:
 
             for idx in range(min(total, 120)):
                 item = articles.nth(idx)
-                link = item.locator('a[href*="/status/"]').first
-                if not await self._count_locator(link):
-                    continue
-                href = (await self._get_attribute(link, "href")) or ""
-                post_id = self._extract_post_id(href)
+                href = await self._extract_article_status_url(item)
+                post_id = await self._article_primary_post_id(item)
                 if not post_id or post_id in seen_ids:
                     continue
 
@@ -556,6 +574,8 @@ class _AdapterReadMixin:
                 created_at = await self._extract_article_timestamp(item)
                 if created_at and created_at <= cutoff:
                     old_in_round = True
+                    seen_ids.add(post_id)
+                    continue
 
                 metrics = await self._extract_article_metrics(item)
                 limit_state = self._extract_article_author_limit_state(body)
@@ -601,16 +621,19 @@ class _AdapterReadMixin:
                 await self._random_scroll(random.randint(460, 1280))
                 await self.human.jitter(260, 720)
 
-        return mentions
+        return mentions[:max_items]
 
     async def search_posts(self, query: str, limit: int = 10) -> list[ObservedPostData]:
         """Execute the `search_posts` controller operation."""
-        limit = max(1, int(limit))
+        normalized_query = str(query or "").strip()
+        if not normalized_query:
+            raise ValueError("query must not be empty")
+        limit = _require_positive_int(limit, "limit")
         if not self.page:
             return []
 
         # Click-first flow: open search UI, type, and switch tabs.
-        if await self._open_search_query(query):
+        if await self._open_search_query(normalized_query):
             await self._set_search_mode("live")
             posts = await self._collect_posts_from_current_page(
                 limit=limit,
@@ -634,8 +657,8 @@ class _AdapterReadMixin:
 
         # URL fallback only if UI-driven flow fails.
         search_urls = [
-            f"{self.BASE_URL}/search?q={quote_plus(query)}&f=live",
-            f"{self.BASE_URL}/search?q={quote_plus(query)}&f=top",
+            f"{self.BASE_URL}/search?q={quote_plus(normalized_query)}&f=live",
+            f"{self.BASE_URL}/search?q={quote_plus(normalized_query)}&f=top",
         ]
         for idx, url in enumerate(search_urls, start=1):
             try:
@@ -652,7 +675,7 @@ class _AdapterReadMixin:
             )
             if posts:
                 return posts
-            logger.info("search_empty_result query=%s mode=%s", query, "live" if idx == 1 else "top")
+            logger.info("search_empty_result query=%s mode=%s", normalized_query, "live" if idx == 1 else "top")
         return []
 
     def _parse_count_token(self, raw: str) -> int:
@@ -1167,10 +1190,21 @@ class _AdapterReadMixin:
         source: str | None = None,
     ) -> list[dict[str, int | str | bool]]:
         """Return service diagnostics for `profile_recent_metrics`."""
-        if not self.page:
-            return []
-        handle = self._normalize_username(username)
+        handle = self._normalize_account_handle(username)
         if not handle:
+            raise ValueError("username must be a valid X handle")
+        if isinstance(limit, bool):
+            raise ValueError("limit must be a non-negative integer")
+        try:
+            max_rows = int(limit)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("limit must be a non-negative integer") from exc
+        if max_rows < 0:
+            raise ValueError("limit must be a non-negative integer")
+        max_rows = min(max_rows, 3000)
+        if max_rows == 0:
+            return []
+        if not self.page:
             return []
         source_filter = str(source or "").strip().lower()
         if source_filter in {"reply", "replies"}:
@@ -1179,8 +1213,6 @@ class _AdapterReadMixin:
             source_filter = ""
         rows: list[dict[str, int | str | bool]] = []
         seen: set[str] = set()
-        max_rows = max(5, min(limit, 3000))
-        row_cap = max_rows * 2
         endpoints = [
             (f"{self.BASE_URL}/{handle}", "posts"),
             (f"{self.BASE_URL}/{handle}/with_replies", "with_replies"),
@@ -1224,12 +1256,12 @@ class _AdapterReadMixin:
                                 "source": source,
                             }
                         )
-                        if len(rows) >= row_cap:
-                            return rows
+                        if len(rows) >= max_rows:
+                            return rows[:max_rows]
                     if round_idx < scroll_rounds - 1:
                         await self._random_scroll(random.randint(320, 1080))
                         await self.human.jitter(240, 580)
-            return rows
+            return rows[:max_rows]
         finally:
             await self._return_home()
 
@@ -1244,7 +1276,7 @@ class _AdapterReadMixin:
 
     async def _article_summary(self, article: Any, *, target_post_id: str = "", thread_index: int | None = None) -> dict[str, Any]:
         url = await self._extract_article_status_url(article)
-        post_id = self._extract_post_id(url)
+        post_id = await self._article_primary_post_id(article)
         text = (await self._extract_article_text(article))[:1200]
         body = text
         with contextlib.suppress(Exception):
@@ -1351,6 +1383,18 @@ class _AdapterReadMixin:
         result.ok = True
         return result
 
+    @staticmethod
+    def _image_signature_matches(extension: str, header: bytes) -> bool:
+        signatures = {
+            ".gif": lambda value: value.startswith((b"GIF87a", b"GIF89a")),
+            ".jpeg": lambda value: value.startswith(b"\xff\xd8\xff"),
+            ".jpg": lambda value: value.startswith(b"\xff\xd8\xff"),
+            ".png": lambda value: value.startswith(b"\x89PNG\r\n\x1a\n"),
+            ".webp": lambda value: len(value) >= 12 and value[:4] == b"RIFF" and value[8:12] == b"WEBP",
+        }
+        validator = signatures.get(extension.lower())
+        return bool(validator and validator(header))
+
     async def attach_images_preflight(self, image_paths: ImagePathInput | None) -> MediaPreflight:
         """Return service diagnostics for `attach_images_preflight`."""
         candidates: list[ImagePath]
@@ -1379,7 +1423,19 @@ class _AdapterReadMixin:
                 item["reason"] = "unsupported_extension"
                 errors.append(item)
                 continue
-            item["size_bytes"] = path.stat().st_size
+            try:
+                item["size_bytes"] = path.stat().st_size
+                with path.open("rb") as image_file:
+                    header = image_file.read(12)
+            except OSError as exc:
+                item["reason"] = "file_unreadable"
+                item["error_type"] = type(exc).__name__
+                errors.append(item)
+                continue
+            if not self._image_signature_matches(path.suffix.lower(), header):
+                item["reason"] = "invalid_image_signature"
+                errors.append(item)
+                continue
             normalized.append(str(path))
         upload_input_found = False
         if self.page:
@@ -1394,29 +1450,60 @@ class _AdapterReadMixin:
             raw={"upload_input_found": upload_input_found},
         )
 
-    async def debug_snapshot(self, output_dir: str | os.PathLike[str], article_limit: int = 12) -> dict[str, Any]:
-        """Return service diagnostics for `debug_snapshot`."""
+    async def debug_snapshot(
+        self,
+        output_dir: str | os.PathLike[str],
+        article_limit: int = 12,
+        *,
+        overwrite: bool = False,
+        include_sensitive_content: bool = False,
+    ) -> dict[str, Any]:
+        """Write a safe manifest, with full page artifacts only by explicit opt-in."""
+        if self.page and not await self._page_is_trusted(self.page):
+            raise RuntimeError("debug_snapshot_requires_trusted_x_origin")
         out_dir = Path(output_dir).expanduser()
         if not out_dir.is_absolute():
             out_dir = (Path.cwd() / out_dir).resolve()
         out_dir.mkdir(parents=True, exist_ok=True)
+        with contextlib.suppress(OSError):
+            os.chmod(out_dir, 0o700)
         html_path = out_dir / "page.html"
         screenshot_path = out_dir / "page.png"
         manifest_path = out_dir / "manifest.json"
+        all_targets = (manifest_path, html_path, screenshot_path)
+        symlinks = [path.name for path in all_targets if path.is_symlink()]
+        if symlinks:
+            raise ValueError(f"debug_snapshot_symlink_target:{','.join(symlinks)}")
+        sensitive_existing = [path.name for path in (html_path, screenshot_path) if path.exists()]
+        if sensitive_existing and not include_sensitive_content:
+            raise FileExistsError(
+                f"debug_snapshot_sensitive_artifacts_present:{','.join(sensitive_existing)}"
+            )
+        targets = all_targets if include_sensitive_content else (manifest_path,)
+        existing = [path.name for path in targets if path.exists()]
+        if existing and not overwrite:
+            raise FileExistsError(f"debug_snapshot_target_exists:{','.join(existing)}")
 
-        page_html = await self._page_content()
-        html_path.write_text(page_html, encoding="utf-8")
-        try:
-            await self._screenshot(str(screenshot_path))
-        except Exception as exc:
-            logger.debug("debug_snapshot_screenshot_failed path=%s error=%s", str(screenshot_path), str(exc)[:260])
+        if include_sensitive_content:
+            page_html = await self._page_content()
+            html_path.write_text(page_html, encoding="utf-8")
+            with contextlib.suppress(OSError):
+                os.chmod(html_path, 0o600)
+            try:
+                await self._screenshot(str(screenshot_path))
+                with contextlib.suppress(OSError):
+                    os.chmod(screenshot_path, 0o600)
+            except Exception as exc:
+                logger.debug("debug_snapshot_screenshot_failed path=%s error=%s", str(screenshot_path), str(exc)[:260])
 
         articles_summary: list[dict[str, Any]] = []
         article_count = 0
         if self.page:
             articles = self.page.locator("article")
             article_count = await self._count_locator(articles)
-            for idx in range(min(article_count, max(0, int(article_limit)))):
+            for idx in range(
+                min(article_count, max(0, int(article_limit))) if include_sensitive_content else 0
+            ):
                 try:
                     articles_summary.append(await self._article_summary(articles.nth(idx), thread_index=idx))
                 except Exception as exc:
@@ -1430,22 +1517,48 @@ class _AdapterReadMixin:
             "media_input": bool(self.page and await self._find_media_input_for_composer(None, timeout_ms=200)),
         }
         login_state = await self.login_state()
+        login_details = (
+            login_state.to_dict()
+            if include_sensitive_content
+            else {
+                "logged_in": login_state.logged_in,
+                "page_state": login_state.page_state,
+                "browser_started": login_state.browser_started,
+                "login_required": login_state.login_required,
+            }
+        )
+        recent_parser_warnings = [
+            dict(item) for item in getattr(self, "_recent_parser_warnings", [])[-5:]
+        ]
+        if not include_sensitive_content:
+            for warning in recent_parser_warnings:
+                if "url" in warning:
+                    warning["url"] = self._redact_url_for_log(warning.get("url"))
         manifest = {
-            "url": self.page.url if self.page else "",
+            "artifact_security": {
+                "sensitive": True,
+                "classification": "browser_session_snapshot",
+                "contains_page_content": include_sensitive_content,
+                "sensitive_content_opted_in": include_sensitive_content,
+                "share_with_care": True,
+            },
+            "url": self._redact_url_for_log(self.page.url if self.page else ""),
             "current_state": await self._current_state_name(),
             "login_state": "logged_in" if login_state.logged_in else "login_required" if self.page else "not_started",
-            "login_details": login_state.to_dict(),
+            "login_details": login_details,
             "active_home_tab": await self._active_home_tab(),
             "article_count": article_count,
             "articles": articles_summary,
-            "visible_dialogs": await self._visible_dialogs(),
+            "visible_dialogs": await self._visible_dialogs() if include_sensitive_content else [],
             "composer_state": {"open": await self._is_compose_state()},
             "selector_probe": selector_probe,
-            "recent_parser_warnings": [dict(item) for item in getattr(self, "_recent_parser_warnings", [])[-5:]],
-            "screenshot_path": str(screenshot_path),
-            "html_path": str(html_path),
+            "recent_parser_warnings": recent_parser_warnings,
+            "screenshot_path": str(screenshot_path) if include_sensitive_content else "",
+            "html_path": str(html_path) if include_sensitive_content else "",
         }
         manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True), encoding="utf-8")
+        with contextlib.suppress(OSError):
+            os.chmod(manifest_path, 0o600)
         return {"manifest_path": str(manifest_path), **manifest}
 
     async def capture_post_media(
@@ -1453,30 +1566,54 @@ class _AdapterReadMixin:
         platform_post_id: str,
         output_dir: str | os.PathLike[str],
         frame_count: int = 3,
+        *,
+        overwrite: bool = False,
     ) -> list[MediaCaptureData]:
         """Return service diagnostics for `capture_post_media`."""
         target_id = self._normalize_post_id(platform_post_id)
         if not target_id or not self.page:
             return []
+        if isinstance(frame_count, bool) or int(frame_count) <= 0:
+            raise ValueError("frame_count must be a positive integer")
         out_dir = Path(output_dir).expanduser()
         if not out_dir.is_absolute():
             out_dir = (Path.cwd() / out_dir).resolve()
         out_dir.mkdir(parents=True, exist_ok=True)
+        with contextlib.suppress(OSError):
+            os.chmod(out_dir, 0o700)
+        existing = list(out_dir.glob(f"{target_id}_*.png"))
+        symlinks = [path.name for path in existing if path.is_symlink()]
+        if symlinks:
+            raise ValueError(f"media_capture_symlink_target:{','.join(symlinks)}")
+        if existing and not overwrite:
+            raise FileExistsError(
+                f"media_capture_target_exists:{','.join(path.name for path in existing)}"
+            )
 
         if not await self._open_post_page(target_id):
             return []
         article = await self._resolve_target_article(target_id)
         if article is None:
             return []
-        captures = await self._capture_article_media_nodes(article, target_id, out_dir, frame_count=frame_count)
+        captures = await self._capture_article_media_nodes(
+            article,
+            target_id,
+            out_dir,
+            frame_count=frame_count,
+            overwrite=overwrite,
+        )
+        for item in captures:
+            if item.path:
+                with contextlib.suppress(OSError):
+                    os.chmod(item.path, 0o600)
         return [item for item in captures if item.path]
 
     async def _visible_dialogs(self) -> list[str]:
-        if not self.page:
+        if not self.page or not await self._page_is_trusted(self.page):
             return []
         try:
             value = await self._evaluate(
-                """() => Array.from(document.querySelectorAll('[role="dialog"]'))
+                r"""() => Array.from(document.querySelectorAll('[role="dialog"]'))
                     .filter(node => {
                         const rect = node.getBoundingClientRect();
                         const style = window.getComputedStyle(node);
@@ -1489,11 +1626,87 @@ class _AdapterReadMixin:
             logger.debug("visible_dialogs_probe_failed error=%s", str(exc)[:260])
             return []
 
+    async def _visible_system_messages(self) -> list[str]:
+        """Return visible system UI text without scanning timeline article content."""
+        if not self.page or not await self._page_is_trusted(self.page):
+            return []
+        try:
+            value = await self._evaluate(
+                r"""() => Array.from(document.querySelectorAll([
+                        '[role="dialog"]',
+                        '[role="alert"]',
+                        '[role="status"]',
+                        '[aria-live="assertive"]',
+                        '[aria-live="polite"]',
+                        '[data-testid="toast"]',
+                        '[data-testid="error-detail"]'
+                    ].join(',')))
+                    .filter(node => {
+                        if (node.closest('article')) return false;
+                        const rect = node.getBoundingClientRect();
+                        const style = window.getComputedStyle(node);
+                        return rect.width > 0 && rect.height > 0 && style.visibility !== 'hidden' && style.display !== 'none';
+                    })
+                    .map(node => String(node.innerText || node.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 400))
+                    .filter(Boolean)"""
+            )
+            if not isinstance(value, list):
+                return []
+            messages: list[str] = []
+            for item in value:
+                text = str(item).strip()
+                if text and text not in messages:
+                    messages.append(text)
+            return messages
+        except Exception as exc:
+            logger.debug("visible_system_messages_probe_failed error=%s", str(exc)[:260])
+            return []
+
+    async def _wait_for_selector_compat(self, selector: str, timeout_ms: int) -> Any:
+        """Wait for a selector through the active Playwright execution mode."""
+        page = self._sync_page if self._sync_mode and self._sync_page is not None else self.page
+        if page is None:
+            return None
+        if self._sync_mode:
+            return await self._run_sync(page.wait_for_selector, selector, timeout=timeout_ms)
+        return await page.wait_for_selector(selector, timeout=timeout_ms)
+
     async def health_check(self) -> ControllerHealth:
         """Return structured controller state from `health_check`."""
         browser_started = self.page is not None
-        state = await self.login_state()
-        content = (await self._page_content()).lower() if browser_started else ""
+        raw: dict[str, Any] = {
+            "recent_parser_warnings": [
+                dict(item) for item in getattr(self, "_recent_parser_warnings", [])[-5:]
+            ]
+        }
+        try:
+            state = await self.login_state()
+        except Exception as exc:
+            reason = "target_closed" if self._is_target_closed_error(exc) else "state_probe_failed"
+            raw.update(
+                {
+                    "degraded": True,
+                    "degraded_reason": reason,
+                    "health_check_error": {
+                        "type": type(exc).__name__,
+                        "message": str(exc)[:400],
+                    },
+                }
+            )
+            return ControllerHealth(
+                browser_started=browser_started,
+                logged_in=False,
+                current_url=await self._page_url(self.page),
+                current_state="unavailable" if browser_started else "not_started",
+                login_required=True,
+                last_action_error=self.last_action_error.to_dict() if self.last_action_error else {},
+                raw=raw,
+            )
+
+        system_messages = await self._visible_system_messages()
+        system_text = " ".join(system_messages).lower()
+        visible_dialogs = await self._visible_dialogs()
+        raw["visible_system_messages"] = system_messages
         return ControllerHealth(
             browser_started=browser_started,
             logged_in=state.logged_in,
@@ -1501,11 +1714,29 @@ class _AdapterReadMixin:
             current_state=state.page_state,
             active_home_tab=state.active_home_tab,
             login_required=state.login_required,
-            account_locked="account is locked" in content or "temporarily restricted" in content,
-            rate_limited="rate limit" in content or "try again later" in content,
-            blocking_modal_present=bool(await self._visible_dialogs()),
+            account_locked=any(
+                marker in system_text
+                for marker in (
+                    "account is locked",
+                    "account has been locked",
+                    "temporarily restricted",
+                    "account is suspended",
+                    "account suspended",
+                )
+            ),
+            rate_limited=any(
+                marker in system_text
+                for marker in (
+                    "rate limit",
+                    "rate-limit",
+                    "too many requests",
+                    "try again later",
+                    "reached your limit",
+                )
+            ),
+            blocking_modal_present=bool(visible_dialogs),
             last_action_error=self.last_action_error.to_dict() if self.last_action_error else {},
-            raw={"recent_parser_warnings": [dict(item) for item in getattr(self, "_recent_parser_warnings", [])[-5:] ]},
+            raw=raw,
         )
 
     async def read_post_thread_context(
@@ -1525,7 +1756,7 @@ class _AdapterReadMixin:
             if await self._count_locator(articles_probe):
                 break
             with contextlib.suppress(Exception):
-                await self.page.wait_for_selector("article", timeout=1800)
+                await self._wait_for_selector_compat("article", timeout_ms=1800)
             await self.human.jitter(250, 650)
         summaries: list[dict[str, Any]] = []
         seen_ids: set[str] = set()
@@ -1549,30 +1780,51 @@ class _AdapterReadMixin:
             await self._random_scroll(850)
             await self.human.jitter(220, 620)
             await self._wait_network_idle(900)
+        target_summary_index = next(
+            (idx for idx, summary in enumerate(summaries) if str(summary.get("post_id") or "") == target_id),
+            -1,
+        )
         rows: list[ObservedPostData] = []
-        for summary in summaries:
+        for summary_index, summary in enumerate(summaries):
             item_id = str(summary.get("post_id") or "")
             if not item_id:
                 continue
             is_target = item_id == target_id
+            if is_target:
+                thread_role = "target"
+            elif target_summary_index < 0:
+                thread_role = "unknown"
+            elif summary_index < target_summary_index:
+                thread_role = "parent"
+            else:
+                thread_role = "reply"
             if is_target and not include_target:
                 continue
-            if not is_target and not (include_parent or include_replies):
+            if thread_role == "parent" and not include_parent:
+                continue
+            if thread_role == "reply" and not include_replies:
+                continue
+            if thread_role == "unknown" and not (include_parent and include_replies):
                 continue
             rows.append(
                 ObservedPostData(
                     platform_post_id=item_id,
                     author=str(summary.get("author") or ""),
                     text=str(summary.get("text") or ""),
-                    raw={**summary, "conversation_id": target_id},
+                    raw={**summary, "conversation_id": target_id, "thread_role": thread_role},
                 )
             )
         max_limit = max(1, int(limit))
         if len(rows) > max_limit:
             target_index = next((idx for idx, row in enumerate(rows) if row.platform_post_id == target_id), -1)
             if target_index >= 0:
-                start = max(0, target_index - max_limit + 1)
-                rows = rows[start : target_index + 1]
-            else:
+                parent_slots = (max_limit - 1) // 2
+                start = max(0, target_index - parent_slots)
+                end = min(len(rows), start + max_limit)
+                start = max(0, end - max_limit)
+                rows = rows[start:end]
+            elif include_parent and not include_replies:
                 rows = rows[-max_limit:]
+            else:
+                rows = rows[:max_limit]
         return rows

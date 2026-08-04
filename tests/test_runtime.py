@@ -54,6 +54,27 @@ class FakeLocator:
     async def count(self) -> int:
         return self._count
 
+    async def is_visible(self) -> bool:
+        return self._count > 0
+
+
+class FakeStatusLink(FakeLocator):
+    def __init__(self, href: str) -> None:
+        super().__init__(1)
+        self.href = href
+
+    async def get_attribute(self, name: str) -> str | None:
+        return self.href if name == "href" else None
+
+
+class FakeStatusLinks(FakeLocator):
+    def __init__(self, status_ids: set[str]) -> None:
+        self._links = [FakeStatusLink(f"/owner/status/{post_id}") for post_id in sorted(status_ids)]
+        super().__init__(len(self._links))
+
+    def nth(self, index: int) -> FakeStatusLink:
+        return self._links[index]
+
 
 class FakeArticle:
     def __init__(self, name: str, status_ids: set[str]) -> None:
@@ -63,7 +84,12 @@ class FakeArticle:
     async def count(self) -> int:
         return 1
 
+    async def is_visible(self) -> bool:
+        return True
+
     def locator(self, selector: str) -> FakeLocator:
+        if selector == 'a[href*="/status/"]':
+            return FakeStatusLinks(self.status_ids)
         matches = any(f"/status/{post_id}" in selector for post_id in self.status_ids)
         return FakeLocator(1 if matches else 0)
 
@@ -81,6 +107,8 @@ class FakeArticleList:
 
 
 class FakeArticlePage:
+    url = "https://x.com/home"
+
     def __init__(self, articles: list[FakeArticle]) -> None:
         self._articles = FakeArticleList(articles)
 
@@ -168,6 +196,9 @@ class RuntimeLifecycleTests(unittest.IsolatedAsyncioTestCase):
         parent = FakeArticle("parent", {"111"})
         reply = FakeArticle("reply", {"222"})
         self.adapter.page = FakeArticlePage([parent, reply])  # type: ignore[assignment]
+        self.adapter._bind_locator = AsyncMock(  # type: ignore[method-assign]
+            side_effect=lambda article, _purpose: (article, "stable")
+        )
 
         selected = await self.adapter._post_metrics_article("222")
 
@@ -198,14 +229,13 @@ class RuntimeLifecycleTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(metrics, {})
 
-    async def test_submit_post_logs_warning_when_meta_enter_fails(self) -> None:
+    async def test_submit_post_uses_one_platform_shortcut_and_does_not_retry(self) -> None:
         self.adapter.page = object()  # type: ignore[assignment]
         self.adapter._find_first = AsyncMock(return_value=None)  # type: ignore[method-assign]
         self.adapter._wait_for_post_submission = AsyncMock(return_value=False)  # type: ignore[method-assign]
 
-        async def fake_keyboard_press(key: str) -> None:
-            if key == "Meta+Enter":
-                raise RuntimeError("meta boom")
+        async def fake_keyboard_press(_key: str) -> None:
+            raise RuntimeError("shortcut boom")
 
         self.adapter._keyboard_press = AsyncMock(side_effect=fake_keyboard_press)  # type: ignore[method-assign]
 
@@ -213,7 +243,10 @@ class RuntimeLifecycleTests(unittest.IsolatedAsyncioTestCase):
             submitted = await self.adapter._submit_post()
 
         self.assertFalse(submitted)
-        self.assertTrue(any("submit_post_shortcut_failed" in line and "Meta+Enter" in line for line in logs.output))
+        expected = "Meta+Enter" if sys.platform == "darwin" else "Control+Enter"
+        self.adapter._keyboard_press.assert_awaited_once_with(expected)
+        self.adapter._wait_for_post_submission.assert_not_awaited()
+        self.assertTrue(any("submit_post_shortcut_failed" in line and expected in line for line in logs.output))
 
 
 if __name__ == "__main__":

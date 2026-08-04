@@ -7,7 +7,7 @@ import sys
 import unittest
 
 try:
-    import XController
+    importlib.import_module("XController")
 except ModuleNotFoundError as exc:
     if exc.name != "XController":
         raise
@@ -22,7 +22,6 @@ except ModuleNotFoundError as exc:
     module = importlib.util.module_from_spec(spec)
     sys.modules["XController"] = module
     spec.loader.exec_module(module)
-    import XController
 
 
 class ModuleDocstringTests(unittest.TestCase):
