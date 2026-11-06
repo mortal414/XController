@@ -2,9 +2,11 @@
 
 `XController` is a click-first Playwright library for automating common X.com workflows with a persistent browser profile.
 
-It is designed for reuse from scripts and services instead of a single hard-coded workflow.
+I built it as a personal browser-automation experiment, with reusable scripts and services in mind.
 
-`main` is the clean integration branch for downstream projects. Lab UI, lab API, and test-harness work live on `labui-testing`.
+**Status:** I'm not currently using or developing this project. X's interface can change, so the workflows may need repairs before use. Use only accounts and actions you are authorized to control.
+
+`main` contains the controller package. The separate `labui-testing` branch contains lab UI, API, and test-harness experiments.
 
 ## What It Supports
 
